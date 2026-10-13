@@ -1430,15 +1430,23 @@ pub mod test {
         ItemId, ItemNavHistory, Workspace, WorkspaceId,
         item::{ItemBufferKind, SaveOptions},
     };
+    use futures::{channel::oneshot, future::Shared};
     use gpui::{
         AnyElement, App, AppContext as _, Context, Entity, EntityId, EventEmitter, Focusable,
-        InteractiveElement, IntoElement, ParentElement, Render, SharedString, Task, WeakEntity,
-        Window,
+        Global, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Task,
+        WeakEntity, Window,
     };
     use language::Capability;
     use project::{Project, ProjectEntryId, ProjectPath, WorktreeId};
     use std::{any::Any, cell::Cell, sync::Arc};
     use util::rel_path::rel_path;
+
+    pub struct PendingTestItemDeserialization {
+        pub finished: Shared<oneshot::Receiver<()>>,
+        pub item_ids: Option<Vec<ItemId>>,
+    }
+
+    impl Global for PendingTestItemDeserialization {}
 
     pub struct TestProjectItem {
         pub entry_id: Option<ProjectEntryId>,
@@ -1851,12 +1859,27 @@ pub mod test {
             _project: Entity<Project>,
             _workspace: WeakEntity<Workspace>,
             workspace_id: WorkspaceId,
-            _item_id: ItemId,
+            item_id: ItemId,
             _window: &mut Window,
             cx: &mut App,
         ) -> Task<anyhow::Result<Entity<Self>>> {
-            let entity = cx.new(|cx| Self::new_deserialized(workspace_id, cx));
-            Task::ready(Ok(entity))
+            match cx
+                .try_global::<PendingTestItemDeserialization>()
+                .filter(|pending| {
+                    pending
+                        .item_ids
+                        .as_ref()
+                        .is_none_or(|item_ids| item_ids.contains(&item_id))
+                }) {
+                Some(pending) => {
+                    let pending = pending.finished.clone();
+                    cx.spawn(async move |cx| {
+                        pending.await.ok();
+                        Ok(cx.new(|cx| Self::new_deserialized(workspace_id, cx)))
+                    })
+                }
+                None => Task::ready(Ok(cx.new(|cx| Self::new_deserialized(workspace_id, cx)))),
+            }
         }
 
         fn cleanup(

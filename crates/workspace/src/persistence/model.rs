@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
-use collections::IndexSet;
+use collections::{HashSet, IndexSet};
 use db::sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
@@ -148,6 +148,13 @@ pub(crate) struct SerializedWorkspace {
     pub(crate) user_toolchains: BTreeMap<ToolchainScope, IndexSet<Toolchain>>,
     pub(crate) recent_navigation_history: Vec<PathBuf>,
     pub(crate) window_id: Option<u64>,
+    pub(crate) unserialized_root_files: Option<UnserializedRootFiles>,
+}
+
+#[derive(Debug, PartialEq, Clone, Default)]
+pub(crate) struct UnserializedRootFiles {
+    pub(crate) paths: PathList,
+    pub(crate) active: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize)]
@@ -334,6 +341,61 @@ impl SerializedPaneGroup {
             }
         }
     }
+
+    pub(crate) fn item_count(&self) -> usize {
+        match self {
+            SerializedPaneGroup::Group { children, .. } => {
+                children.iter().map(SerializedPaneGroup::item_count).sum()
+            }
+            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane.children.len(),
+        }
+    }
+
+    pub(crate) fn item_keys(&self) -> HashSet<(Arc<str>, ItemId)> {
+        match self {
+            SerializedPaneGroup::Group { children, .. } => children
+                .iter()
+                .flat_map(SerializedPaneGroup::item_keys)
+                .collect(),
+            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane
+                .children
+                .iter()
+                .map(SerializedItem::key)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn append_unrestored_items(
+        &mut self,
+        restored_items: &HashSet<(Arc<str>, ItemId)>,
+        live_items: Vec<SerializedItem>,
+    ) {
+        let saved_keys = self.item_keys();
+        let new_items = live_items
+            .into_iter()
+            .filter(|item| {
+                let key = item.key();
+                !restored_items.contains(&key) && !saved_keys.contains(&key)
+            })
+            .collect::<Vec<_>>();
+        let mut panes = Vec::new();
+        self.collect_panes_mut(&mut panes);
+        let target_index = panes.iter().position(|pane| pane.active).unwrap_or(0);
+        if let Some(target) = panes.into_iter().nth(target_index) {
+            target.children.extend(new_items);
+        }
+    }
+
+    fn collect_panes_mut<'a>(&'a mut self, panes: &mut Vec<&'a mut SerializedPane>) {
+        match self {
+            SerializedPaneGroup::Group { children, .. } => {
+                for child in children {
+                    child.collect_panes_mut(panes);
+                }
+            }
+            SerializedPaneGroup::Pane(serialized_pane) => panes.push(serialized_pane),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Default, Clone)]
@@ -385,11 +447,19 @@ impl SerializedPane {
         }
 
         let mut items = Vec::new();
-        for item_handle in futures::future::join_all(item_tasks).await {
+        for (serialized_item, item_handle) in self
+            .children
+            .iter()
+            .zip(futures::future::join_all(item_tasks).await)
+        {
             let item_handle = item_handle.log_err();
             items.push(item_handle.clone());
 
             if let Some(item_handle) = item_handle {
+                workspace.update(cx, |workspace, _| {
+                    workspace
+                        .record_restored_item(serialized_item.kind.clone(), item_handle.item_id())
+                })?;
                 pane.update_in(cx, |pane, window, cx| {
                     pane.add_item(item_handle.clone(), true, true, None, window, cx);
                 })?;
@@ -446,6 +516,10 @@ impl SerializedItem {
             active,
             preview,
         }
+    }
+
+    pub(crate) fn key(&self) -> (Arc<str>, ItemId) {
+        (self.kind.clone(), self.item_id)
     }
 }
 

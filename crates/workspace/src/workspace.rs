@@ -58,7 +58,7 @@ use futures::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
-    future::{Shared, try_join_all},
+    future::{Either, Shared, select, try_join_all},
 };
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AppContext, AsyncApp, AsyncWindowContext, Axis,
@@ -95,12 +95,19 @@ pub use persistence::{
     },
     read_serialized_multi_workspaces,
 };
-use persistence::{SerializedWindowBounds, model::SerializedWorkspace};
+use persistence::{
+    SerializedWindowBounds,
+    model::{SerializedWorkspace, UnserializedRootFiles},
+};
 use postage::stream::Stream;
 use project::{
     DirectoryLister, Project, ProjectEntryId, ProjectPath, ResolvedPath, Worktree, WorktreeId,
     WorktreeSettings,
-    debugger::{breakpoint_store::BreakpointStoreEvent, session::ThreadStatus},
+    bookmark_store::SerializedBookmark,
+    debugger::{
+        breakpoint_store::{BreakpointStoreEvent, SourceBreakpoint},
+        session::ThreadStatus,
+    },
     git_store::{GitStoreEvent, RepositoryEvent},
     project_settings::ProjectSettings,
     toolchain_store::ToolchainStoreEvent,
@@ -130,12 +137,12 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     env,
     hash::Hash,
     path::{Path, PathBuf},
     process::ExitStatus,
-    rc::Rc,
+    rc::{self, Rc},
     sync::{
         Arc, LazyLock,
         atomic::{AtomicBool, AtomicUsize},
@@ -165,7 +172,10 @@ pub use workspace_settings::{
 };
 use zed_actions::{Spawn, feedback::FileBugReport, theme::ToggleMode};
 
-use crate::{dock::PanelSizeState, item::ItemBufferKind, notifications::NotificationId};
+use crate::{
+    dock::PanelSizeState, invalid_item_view::InvalidItemView, item::ItemBufferKind,
+    notifications::NotificationId,
+};
 use crate::{
     persistence::{
         SerializedAxis,
@@ -1622,6 +1632,7 @@ pub struct Workspace {
     _observe_current_user: Task<Result<()>>,
     _schedule_serialize_workspace: Option<Task<()>>,
     _serialize_workspace_task: Option<Task<()>>,
+    last_workspace_write: Option<Shared<Task<()>>>,
     _schedule_serialize_ssh_paths: Option<Task<()>>,
     pane_history_timestamp: Arc<AtomicUsize>,
     bounds: Bounds<Pixels>,
@@ -1654,6 +1665,22 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    restoring_layout: Option<RestoringLayout>,
+    restoration_finished: Option<Shared<oneshot::Receiver<()>>>,
+    is_remote_connection_placeholder: bool,
+    reopening_root_files: Option<(UnserializedRootFiles, rc::Weak<()>)>,
+    deferred_actions: Vec<Task<()>>,
+}
+
+struct RestoringLayout {
+    panes: Option<(SerializedPaneGroup, DockStructure)>,
+    bookmarks: Option<BTreeMap<Arc<Path>, Vec<SerializedBookmark>>>,
+    breakpoints: Option<BTreeMap<Arc<Path>, Vec<SourceBreakpoint>>>,
+    saved_item_keys: HashSet<(Arc<str>, ItemId)>,
+    restored_items: HashSet<(Arc<str>, ItemId)>,
+    previous_active_pane: WeakEntity<Pane>,
+    root_files: Option<UnserializedRootFiles>,
+    load_task_alive: rc::Weak<()>,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2126,6 +2153,7 @@ impl Workspace {
             _apply_leader_updates,
             _schedule_serialize_workspace: None,
             _serialize_workspace_task: None,
+            last_workspace_write: None,
             _schedule_serialize_ssh_paths: None,
             leader_updates_tx,
             _subscriptions: subscriptions,
@@ -2156,6 +2184,11 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            restoring_layout: None,
+            restoration_finished: None,
+            is_remote_connection_placeholder: false,
+            reopening_root_files: None,
+            deferred_actions: Vec::new(),
         }
     }
 
@@ -2166,6 +2199,30 @@ impl Workspace {
         env: Option<HashMap<String, String>>,
         init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
         open_mode: OpenMode,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
+        Self::new_local_inner(
+            abs_paths,
+            app_state,
+            requesting_window,
+            env,
+            init,
+            open_mode,
+            false,
+            None,
+            cx,
+        )
+    }
+
+    fn new_local_inner(
+        abs_paths: Vec<PathBuf>,
+        app_state: Arc<AppState>,
+        requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        env: Option<HashMap<String, String>>,
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        restoring_session: bool,
+        window_opened: Option<oneshot::Sender<WindowHandle<MultiWorkspace>>>,
         cx: &mut App,
     ) -> Task<anyhow::Result<OpenResult>> {
         let project_handle = Project::local(
@@ -2361,6 +2418,9 @@ impl Workspace {
                         })?;
                     (window, workspace)
                 };
+            if let Some(window_opened) = window_opened {
+                window_opened.send(window).ok();
+            }
 
             notify_if_database_failed(window, cx);
             // Check if this is an empty workspace (no paths to open)
@@ -2374,8 +2434,15 @@ impl Workspace {
 
             let opened_items = window
                 .update(cx, |_, window, cx| {
-                    workspace.update(cx, |_workspace: &mut Workspace, cx| {
-                        open_items(serialized_workspace, project_paths, window, cx)
+                    workspace.update(cx, |workspace: &mut Workspace, cx| {
+                        open_items(
+                            workspace,
+                            serialized_workspace,
+                            project_paths,
+                            restoring_session,
+                            window,
+                            cx,
+                        )
                     })
                 })?
                 .await
@@ -2910,6 +2977,49 @@ impl Workspace {
         self.restoring_workspace
     }
 
+    pub fn pending_restoration(&self) -> Option<Shared<oneshot::Receiver<()>>> {
+        self.restoration_finished
+            .clone()
+            .filter(|restoration_finished| restoration_finished.clone().now_or_never().is_none())
+    }
+
+    pub fn after_restoration(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        match self.pending_restoration() {
+            Some(restoration) => {
+                self.deferred_actions.retain(|action| !action.is_ready());
+                self.deferred_actions
+                    .push(cx.spawn_in(window, async move |workspace, cx| {
+                        restoration.await.ok();
+                        workspace
+                            .update_in(cx, |workspace, window, cx| {
+                                workspace.after_restoration(window, cx, f)
+                            })
+                            .ok();
+                    }));
+            }
+            None => f(self, window, cx),
+        }
+    }
+
+    fn contains_requested_paths(&self, abs_paths: &[PathBuf], cx: &App) -> bool {
+        let project = self.project.read(cx);
+        project.visible_worktrees(cx).next().is_none()
+            || abs_paths
+                .iter()
+                .all(|path| project.visibility_for_path(path, false, cx) == Some(true))
+    }
+
+    fn is_restoring_layout(&self) -> bool {
+        self.restoring_layout.as_ref().is_some_and(|layout| {
+            layout.panes.is_some() && layout.load_task_alive.strong_count() > 0
+        })
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_restoring_workspace(&mut self, restoring: bool) {
         self.restoring_workspace = restoring;
@@ -3353,6 +3463,10 @@ impl Workspace {
         self.open_in_dev_container
     }
 
+    pub fn set_remote_connection_placeholder(&mut self, is_placeholder: bool) {
+        self.is_remote_connection_placeholder = is_placeholder;
+    }
+
     pub fn set_dev_container_task(&mut self, task: Task<Result<()>>) {
         self._dev_container_task = Some(task);
     }
@@ -3723,12 +3837,14 @@ impl Workspace {
                 || save_last_workspace
                 || this
                     .read_with(cx, |workspace, cx| {
-                        workspace
-                            .project
-                            .read(cx)
-                            .visible_worktrees(cx)
-                            .next()
-                            .is_some()
+                        let project = workspace.project.read(cx);
+                        project.visible_worktrees(cx).any(|worktree| {
+                            project.is_via_remote_server()
+                                || !worktree
+                                    .read(cx)
+                                    .root_entry()
+                                    .is_some_and(|entry| entry.is_file())
+                        })
                     })
                     .unwrap_or(false);
             let save_result = this
@@ -4018,10 +4134,16 @@ impl Workspace {
         let fs = self.app_state.fs.clone();
 
         let caller_ordered_abs_paths = abs_paths.clone();
+        let mut caller_indices = (0..abs_paths.len()).collect::<Vec<_>>();
+        caller_indices.sort_by(|left, right| abs_paths[*left].cmp(&abs_paths[*right]));
+        let restoration_finished = self.restoration_finished.clone();
 
         // Sort the paths to ensure we add worktrees for parents before their children.
         abs_paths.sort_unstable();
         cx.spawn_in(window, async move |this, cx| {
+            if let Some(restoration_finished) = restoration_finished {
+                restoration_finished.await.ok();
+            }
             let mut tasks = Vec::with_capacity(abs_paths.len());
 
             for abs_path in &abs_paths {
@@ -4184,7 +4306,9 @@ impl Workspace {
                 }
             }
 
-            results
+            let mut results = caller_indices.into_iter().zip(results).collect::<Vec<_>>();
+            results.sort_by_key(|(caller_index, _)| *caller_index);
+            results.into_iter().map(|(_, result)| result).collect()
         })
     }
 
@@ -5066,6 +5190,26 @@ impl Workspace {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<anyhow::Result<Box<dyn ItemHandle>>> {
+        if let Some(restoration) = self.pending_restoration() {
+            let workspace = self.weak_self.clone();
+            let project_path = path.into();
+            return window.spawn(cx, async move |cx| {
+                restoration.await.ok();
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.open_path_preview(
+                            project_path,
+                            pane,
+                            focus_item,
+                            allow_preview,
+                            activate,
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await
+            });
+        }
         let reveal_if_open = pane.is_none() && WorkspaceSettings::get_global(cx).reveal_if_open;
         let requested_pane = pane.unwrap_or_else(|| {
             self.last_active_center_pane.clone().unwrap_or_else(|| {
@@ -5279,6 +5423,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Box<dyn ItemHandle>>> {
+        if let Some(restoration) = self.pending_restoration() {
+            let project_path = path.into();
+            return cx.spawn_in(window, async move |workspace, cx| {
+                restoration.await.ok();
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.split_path_preview(
+                            project_path,
+                            allow_preview,
+                            split_direction,
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await
+            });
+        }
         let pane = self.last_active_center_pane.clone().unwrap_or_else(|| {
             self.panes
                 .first()
@@ -7586,6 +7747,7 @@ impl Workspace {
             .iter()
             .flat_map(|pane| pane.read(cx).items())
             .filter_map(|item| item.to_serializable_item_handle(cx))
+            .filter(|item| !self.defers_item_serialization(item.as_ref()))
             .fold(HashMap::default(), |mut items, item| {
                 items.entry(item.item_id()).or_insert(item);
                 items
@@ -7682,7 +7844,7 @@ impl Workspace {
         }
     }
 
-    fn serialize_workspace_internal(&self, window: &mut Window, cx: &mut App) -> Task<()> {
+    fn serialize_workspace_internal(&mut self, window: &mut Window, cx: &mut App) -> Task<()> {
         let Some(database_id) = self.database_id() else {
             return Task::ready(());
         };
@@ -7720,29 +7882,56 @@ impl Workspace {
             this.capture_dock_state(window, cx)
         }
 
-        match self.workspace_location(cx) {
+        let write = match self.workspace_location(cx) {
             WorkspaceLocation::Location(location, paths) => {
-                let bookmarks = self.project.update(cx, |project, cx| {
-                    project
-                        .bookmark_store()
-                        .read(cx)
-                        .all_serialized_bookmarks(cx)
-                });
-
-                let breakpoints = self.project.update(cx, |project, cx| {
-                    project
-                        .breakpoint_store()
-                        .read(cx)
-                        .all_source_breakpoints(cx)
-                });
                 let user_toolchains = self
                     .project
                     .read(cx)
                     .user_toolchains(cx)
                     .unwrap_or_default();
 
-                let center_group = build_serialized_pane_group(&self.center.root, window, cx);
-                let docks = build_serialized_docks(self, window, cx);
+                let restoring_layout = self
+                    .restoring_layout
+                    .as_ref()
+                    .filter(|layout| layout.load_task_alive.strong_count() > 0);
+                let (center_group, docks) = match restoring_layout
+                    .and_then(|layout| Some((layout.panes.as_ref()?, &layout.restored_items)))
+                {
+                    Some(((center_group, docks), restored_items)) => {
+                        let mut center_group = center_group.clone();
+                        center_group.append_unrestored_items(
+                            restored_items,
+                            self.panes
+                                .iter()
+                                .flat_map(|pane| serialize_pane_handle(pane, window, cx).children)
+                                .collect(),
+                        );
+                        (center_group, docks.clone())
+                    }
+                    None => (
+                        build_serialized_pane_group(&self.center.root, window, cx),
+                        build_serialized_docks(self, window, cx),
+                    ),
+                };
+                let bookmarks = match restoring_layout.and_then(|layout| layout.bookmarks.clone()) {
+                    Some(bookmarks) => bookmarks,
+                    None => self.project.update(cx, |project, cx| {
+                        project
+                            .bookmark_store()
+                            .read(cx)
+                            .all_serialized_bookmarks(cx)
+                    }),
+                };
+                let breakpoints =
+                    match restoring_layout.and_then(|layout| layout.breakpoints.clone()) {
+                        Some(breakpoints) => breakpoints,
+                        None => self.project.update(cx, |project, cx| {
+                            project
+                                .breakpoint_store()
+                                .read(cx)
+                                .all_source_breakpoints(cx)
+                        }),
+                    };
                 let default_docks = (paths.is_empty()
                     && location == SerializedWorkspaceLocation::Local)
                     .then(|| docks.clone());
@@ -7766,30 +7955,45 @@ impl Workspace {
                     window_id: Some(window.window_handle().window_id().as_u64()),
                     user_toolchains,
                     recent_navigation_history,
+                    unserialized_root_files: Some(self.unserialized_root_files(cx)),
                 };
 
                 let db = WorkspaceDb::global(cx);
                 let kvp = db::kvp::KeyValueStore::global(cx);
-                cx.background_spawn(async move {
+                async move {
                     if let Some(docks) = default_docks {
                         persistence::write_default_dock_state(&kvp, docks)
                             .await
                             .log_err();
                     }
                     db.save_workspace(serialized_workspace).await;
-                })
+                }
+                .boxed()
             }
             WorkspaceLocation::None => {
                 // Save dock state for empty non-local workspaces
                 let docks = build_serialized_docks(self, window, cx);
                 let kvp = db::kvp::KeyValueStore::global(cx);
-                cx.background_spawn(async move {
+                async move {
                     persistence::write_default_dock_state(&kvp, docks)
                         .await
                         .log_err();
-                })
+                }
+                .boxed()
             }
-        }
+        };
+
+        let previous_write = self.last_workspace_write.take();
+        let write = cx
+            .background_spawn(async move {
+                if let Some(previous_write) = previous_write {
+                    previous_write.await;
+                }
+                write.await;
+            })
+            .shared();
+        self.last_workspace_write = Some(write.clone());
+        cx.background_spawn(write)
     }
 
     fn workspace_location(&self, cx: &App) -> WorkspaceLocation {
@@ -7838,12 +8042,37 @@ impl Workspace {
 
             // We use into_iter() here so that the references to the items are moved into
             // the tasks and not kept alive while we're sleeping.
+            let mut deferred_items = Vec::new();
             for (_, item) in unique_items.into_iter() {
-                if let Ok(Some(task)) =
-                    this.update(cx, |workspace, cx| item.serialize(workspace, false, cx))
-                {
-                    cx.background_spawn(async move { task.await.log_err() })
-                        .detach();
+                let serialized = this.update(cx, |workspace, cx| {
+                    if workspace.defers_item_serialization(item.as_ref()) {
+                        Err(item)
+                    } else {
+                        Ok(item.serialize(workspace, false, cx))
+                    }
+                });
+                match serialized {
+                    Ok(Ok(Some(task))) => {
+                        cx.background_spawn(async move { task.await.log_err() })
+                            .detach();
+                    }
+                    Ok(Err(item)) => deferred_items.push(item),
+                    Ok(Ok(None)) | Err(_) => {}
+                }
+            }
+            if !deferred_items.is_empty() {
+                let restoration =
+                    this.read_with(cx, |workspace, _| workspace.pending_restoration())?;
+                if let Some(restoration) = restoration {
+                    restoration.await.ok();
+                }
+                for item in deferred_items {
+                    if let Ok(Some(task)) =
+                        this.update(cx, |workspace, cx| item.serialize(workspace, false, cx))
+                    {
+                        cx.background_spawn(async move { task.await.log_err() })
+                            .detach();
+                    }
                 }
             }
 
@@ -7864,13 +8093,126 @@ impl Workspace {
             .map_err(|err| anyhow!("failed to send serializable item over channel: {err}"))
     }
 
+    fn begin_restoring_layout(
+        &mut self,
+        serialized_workspace: &SerializedWorkspace,
+    ) -> (Rc<()>, oneshot::Sender<()>) {
+        let (finished_tx, finished_rx) = oneshot::channel();
+        self.restoration_finished = Some(finished_rx.shared());
+        let load_task_alive = Rc::new(());
+        self.restoring_layout = Some(RestoringLayout {
+            panes: Some((
+                serialized_workspace.center_group.clone(),
+                serialized_workspace.docks.clone(),
+            )),
+            bookmarks: Some(serialized_workspace.bookmarks.clone()),
+            breakpoints: Some(serialized_workspace.breakpoints.clone()),
+            saved_item_keys: serialized_workspace.center_group.item_keys(),
+            restored_items: HashSet::default(),
+            previous_active_pane: self.active_pane.downgrade(),
+            root_files: serialized_workspace.unserialized_root_files.clone(),
+            load_task_alive: Rc::downgrade(&load_task_alive),
+        });
+        (load_task_alive, finished_tx)
+    }
+
+    pub(crate) fn record_restored_item(&mut self, kind: Arc<str>, item_id: EntityId) {
+        if let Some(layout) = self.restoring_layout.as_mut() {
+            layout.restored_items.insert((kind, item_id.as_u64()));
+        }
+    }
+
+    fn defers_item_serialization(&self, item: &dyn SerializableItemHandle) -> bool {
+        self.is_restoring_layout()
+            && self.restoring_layout.as_ref().is_some_and(|layout| {
+                layout.saved_item_keys.contains(&(
+                    Arc::from(item.serialized_item_kind()),
+                    item.item_id().as_u64(),
+                ))
+            })
+    }
+
+    fn unserialized_root_files(&self, cx: &App) -> UnserializedRootFiles {
+        let project = self.project.read(cx);
+        let unserialized_item_path = |item: &dyn ItemHandle| {
+            if item.to_serializable_item_handle(cx).is_some() {
+                return None;
+            }
+            match item.downcast::<InvalidItemView>() {
+                Some(invalid_item) => Some(invalid_item.read(cx).abs_path.to_path_buf()),
+                None => project.absolute_path(&item.project_path(cx)?, cx),
+            }
+        };
+        let root_files = project
+            .visible_worktrees(cx)
+            .filter_map(|worktree| {
+                let worktree = worktree.read(cx);
+                worktree
+                    .root_entry()
+                    .is_some_and(|entry| entry.is_file())
+                    .then(|| worktree.abs_path().to_path_buf())
+            })
+            .collect::<Vec<_>>();
+        let pending_root_files = self
+            .reopening_root_files
+            .as_ref()
+            .filter(|(_, alive)| alive.strong_count() > 0)
+            .map(|(root_files, _)| root_files)
+            .into_iter()
+            .chain(
+                self.restoring_layout
+                    .as_ref()
+                    .filter(|_| self.is_restoring_layout())
+                    .and_then(|layout| layout.root_files.as_ref()),
+            )
+            .collect::<Vec<_>>();
+        let open_unserialized = self
+            .panes
+            .iter()
+            .flat_map(|pane| pane.read(cx).items())
+            .filter_map(|item| unserialized_item_path(item.as_ref()))
+            .chain(
+                pending_root_files
+                    .iter()
+                    .flat_map(|root_files| root_files.paths.paths().iter().cloned()),
+            )
+            .collect::<HashSet<_>>();
+        let paths = root_files
+            .into_iter()
+            .filter(|root_file| open_unserialized.contains(root_file))
+            .collect::<Vec<_>>();
+        let active = pending_root_files
+            .iter()
+            .find_map(|root_files| {
+                root_files
+                    .active
+                    .clone()
+                    .filter(|active| root_files.paths.paths().contains(active))
+            })
+            .or_else(|| {
+                self.active_pane
+                    .read(cx)
+                    .active_item()
+                    .and_then(|item| unserialized_item_path(item.as_ref()))
+            })
+            .filter(|active| paths.contains(active));
+        UnserializedRootFiles {
+            paths: PathList::new(&paths),
+            active,
+        }
+    }
+
     pub(crate) fn load_workspace(
+        &mut self,
         serialized_workspace: SerializedWorkspace,
         paths_to_open: Vec<Option<ProjectPath>>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
-    ) -> Task<Result<Vec<Option<Box<dyn ItemHandle>>>>> {
+    ) -> Task<Result<(Vec<Option<Box<dyn ItemHandle>>>, bool)>> {
+        let (load_task_alive, restoration_finished) =
+            self.begin_restoring_layout(&serialized_workspace);
         cx.spawn_in(window, async move |workspace, cx| {
+            let _load_task_alive = load_task_alive;
             let recent_navigation_history = serialized_workspace.recent_navigation_history.clone();
             workspace.update(cx, |workspace, _| {
                 workspace.persisted_recent_navigation_history = recent_navigation_history;
@@ -7880,6 +8222,7 @@ impl Workspace {
 
             let mut center_group = None;
             let mut center_items = None;
+            let serialized_item_count = serialized_workspace.center_group.item_count();
 
             // Traverse the splits tree and add to things
             if let Some((group, active_pane, items)) = serialized_workspace
@@ -7891,6 +8234,12 @@ impl Workspace {
                 center_group = Some((group, active_pane))
             }
 
+            let layout_fully_restored = center_items
+                .as_ref()
+                .map_or(0, |items: &Vec<Option<Box<dyn ItemHandle>>>| {
+                    items.iter().flatten().count()
+                })
+                == serialized_item_count;
             let mut items_by_project_path = HashMap::default();
             let mut item_ids_by_kind = HashMap::default();
             let mut all_deserialized_items = Vec::default();
@@ -7921,7 +8270,19 @@ impl Workspace {
             // Remove old panes from workspace panes list
             workspace.update_in(cx, |workspace, window, cx| {
                 if let Some((center_group, active_pane)) = center_group {
-                    workspace.remove_panes(workspace.center.root.clone(), window, cx);
+                    let previous_root = workspace.center.root.clone();
+                    let previous_panes = workspace
+                        .center
+                        .panes()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let previous_active_item_id = workspace
+                        .restoring_layout
+                        .as_ref()
+                        .and_then(|layout| layout.previous_active_pane.upgrade())
+                        .and_then(|pane| pane.read(cx).active_item())
+                        .map(|item| item.item_id());
 
                     // Swap workspace center group
                     workspace.center = PaneGroup::with_root(center_group);
@@ -7934,6 +8295,69 @@ impl Workspace {
                     } else {
                         workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
                     }
+
+                    let target_pane = workspace.active_pane.clone();
+                    let mut item_to_activate = None;
+                    for pane in previous_panes {
+                        let items = pane
+                            .read(cx)
+                            .items()
+                            .map(|item| item.boxed_clone())
+                            .collect::<Vec<_>>();
+                        for item in items {
+                            let item_id = item.item_id();
+                            pane.update(cx, |pane, cx| {
+                                pane.remove_item(item_id, false, false, window, cx)
+                            });
+                            let target_item_id = target_pane.update(cx, |pane, cx| {
+                                let restored_item_id = item
+                                    .project_entry_ids(cx)
+                                    .first()
+                                    .copied()
+                                    .filter(|_| item.buffer_kind(cx) == ItemBufferKind::Singleton)
+                                    .and_then(|entry_id| {
+                                        pane.items()
+                                            .find(|restored| {
+                                                restored.buffer_kind(cx)
+                                                    == ItemBufferKind::Singleton
+                                                    && restored.project_entry_ids(cx).first()
+                                                        == Some(&entry_id)
+                                            })
+                                            .map(|restored| restored.item_id())
+                                    });
+                                match restored_item_id {
+                                    Some(restored_item_id) => restored_item_id,
+                                    None => {
+                                        let destination_index = pane.items_len();
+                                        pane.add_item_inner(
+                                            item,
+                                            false,
+                                            false,
+                                            false,
+                                            Some(destination_index),
+                                            window,
+                                            cx,
+                                        );
+                                        item_id
+                                    }
+                                }
+                            });
+                            if Some(item_id) == previous_active_item_id {
+                                item_to_activate = Some(target_item_id);
+                            }
+                        }
+                    }
+                    if let Some(item_to_activate) = item_to_activate {
+                        target_pane.update(cx, |pane, cx| {
+                            let index = pane
+                                .items()
+                                .position(|item| item.item_id() == item_to_activate);
+                            if let Some(index) = index {
+                                pane.activate_item(index, false, false, window, cx);
+                            }
+                        });
+                    }
+                    workspace.remove_panes(previous_root, window, cx);
                 }
 
                 let docks = serialized_workspace.docks;
@@ -7951,8 +8375,12 @@ impl Workspace {
                 }
 
                 workspace.restoring_workspace = false;
+                if let Some(layout) = workspace.restoring_layout.as_mut() {
+                    layout.panes = None;
+                }
                 cx.notify();
             })?;
+            restoration_finished.send(()).ok();
 
             project
                 .update(cx, |project, cx| {
@@ -7962,8 +8390,13 @@ impl Workspace {
                 })
                 .await
                 .log_err();
+            workspace.update(cx, |workspace, _| {
+                if let Some(layout) = workspace.restoring_layout.as_mut() {
+                    layout.bookmarks = None;
+                }
+            })?;
 
-            let _ = project
+            project
                 .update(cx, |project, cx| {
                     project
                         .breakpoint_store()
@@ -7972,14 +8405,35 @@ impl Workspace {
                                 .with_serialized_breakpoints(serialized_workspace.breakpoints, cx)
                         })
                 })
-                .await;
+                .await
+                .log_err();
+
+            let pending_write = workspace.update(cx, |workspace, _| {
+                workspace.restoring_layout.take();
+                workspace.last_workspace_write.clone()
+            })?;
+            if let Some(pending_write) = pending_write {
+                pending_write.await;
+            }
 
             // Clean up all the items that have _not_ been loaded. Our ItemIds aren't stable. That means
             // after loading the items, we might have different items and in order to avoid
             // the database filling up, we delete items that haven't been loaded now.
             //
             // The items that have been loaded, have been saved after they've been added to the workspace.
-            let clean_up_tasks = workspace.update_in(cx, |_, window, cx| {
+            let clean_up_tasks = workspace.update_in(cx, |workspace, window, cx| {
+                let mut item_ids_by_kind = item_ids_by_kind;
+                let live_items = workspace
+                    .panes
+                    .iter()
+                    .flat_map(|pane| pane.read(cx).items())
+                    .filter_map(|item| item.to_serializable_item_handle(cx))
+                    .collect::<Vec<_>>();
+                for item in live_items {
+                    if let Some(item_ids) = item_ids_by_kind.get_mut(item.serialized_item_kind()) {
+                        item_ids.push(item.item_id().as_u64() as ItemId);
+                    }
+                }
                 item_ids_by_kind
                     .into_iter()
                     .map(|(item_kind, loaded_items)| {
@@ -8007,7 +8461,7 @@ impl Workspace {
                 })
                 .ok();
 
-            Ok(opened_items)
+            Ok((opened_items, layout_fully_restored))
         })
     }
 
@@ -8062,6 +8516,9 @@ impl Workspace {
 
     /// Multiworkspace uses this to add workspace action handling to itself
     pub fn actions(&self, div: Div, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        if self.is_restoring_layout() {
+            return div;
+        }
         let active_item_is_read_only = self
             .active_item(cx)
             .is_some_and(|item| !item.capability(cx).editable());
@@ -9263,13 +9720,39 @@ fn window_bounds_env_override() -> Option<Bounds<Pixels>> {
 }
 
 fn open_items(
+    workspace: &mut Workspace,
     serialized_workspace: Option<SerializedWorkspace>,
     mut project_paths_to_open: Vec<(PathBuf, Option<ProjectPath>)>,
+    restoring_session: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> impl 'static + Future<Output = Result<Vec<Option<Result<Box<dyn ItemHandle>>>>>> + use<> {
+    let reopening_root_files = Rc::new(());
+    let unserialized_root_files = serialized_workspace
+        .as_ref()
+        .and_then(|serialized_workspace| serialized_workspace.unserialized_root_files.clone());
+    let restored_active_root_file = unserialized_root_files
+        .as_ref()
+        .filter(|_| restoring_session)
+        .map(|root_files| root_files.active.clone());
+    if restoring_session && serialized_workspace.is_some() {
+        let reopen_candidates =
+            unserialized_root_files
+                .clone()
+                .unwrap_or_else(|| UnserializedRootFiles {
+                    paths: PathList::new(
+                        &project_paths_to_open
+                            .iter()
+                            .map(|(abs_path, _)| abs_path)
+                            .collect::<Vec<_>>(),
+                    ),
+                    active: None,
+                });
+        workspace.reopening_root_files =
+            Some((reopen_candidates, Rc::downgrade(&reopening_root_files)));
+    }
     let restored_items = serialized_workspace.map(|serialized_workspace| {
-        Workspace::load_workspace(
+        workspace.load_workspace(
             serialized_workspace,
             project_paths_to_open
                 .iter()
@@ -9282,10 +9765,11 @@ fn open_items(
     });
 
     cx.spawn_in(window, async move |workspace, cx| {
+        let _reopening_root_files = reopening_root_files;
         let mut opened_items = Vec::with_capacity(project_paths_to_open.len());
 
         if let Some(restored_items) = restored_items {
-            let restored_items = restored_items.await?;
+            let (restored_items, layout_fully_restored) = restored_items.await?;
 
             let restored_project_paths = restored_items
                 .iter()
@@ -9309,6 +9793,29 @@ fn open_items(
                         *project_path = None;
                     }
                 });
+
+            if restoring_session
+                && layout_fully_restored
+                && let Some(unserialized_root_files) = unserialized_root_files
+            {
+                for (abs_path, project_path) in &mut project_paths_to_open {
+                    if !unserialized_root_files.paths.paths().contains(abs_path) {
+                        *project_path = None;
+                    }
+                }
+            }
+            if restoring_session {
+                let reopening = project_paths_to_open
+                    .iter()
+                    .filter(|(_, project_path)| project_path.is_some())
+                    .map(|(abs_path, _)| abs_path)
+                    .collect::<Vec<_>>();
+                workspace.update(cx, |workspace, _| {
+                    if let Some((root_files, _)) = workspace.reopening_root_files.as_mut() {
+                        root_files.paths = PathList::new(&reopening);
+                    }
+                })?;
+            }
         } else {
             for _ in 0..project_paths_to_open.len() {
                 opened_items.push(None);
@@ -9322,6 +9829,10 @@ fn open_items(
                 .enumerate()
                 .map(|(ix, (abs_path, project_path))| {
                     let workspace = workspace.clone();
+                    let activate = restored_active_root_file
+                        .as_ref()
+                        .is_none_or(|active| active.as_ref() == Some(&abs_path));
+                    let restoring_activation = restored_active_root_file.is_some();
                     cx.spawn(async move |cx| {
                         let file_project_path = project_path?;
                         let abs_path_task = workspace.update(cx, |workspace, cx| {
@@ -9340,10 +9851,18 @@ fn open_items(
                                 ix,
                                 workspace
                                     .update_in(cx, |workspace, window, cx| {
-                                        workspace.open_path(
+                                        let focus_item = activate
+                                            && (!restoring_activation
+                                                || workspace
+                                                    .active_pane()
+                                                    .read(cx)
+                                                    .has_focus(window, cx));
+                                        workspace.open_path_preview(
                                             file_project_path,
                                             None,
-                                            true,
+                                            focus_item,
+                                            false,
+                                            activate,
                                             window,
                                             cx,
                                         )
@@ -9562,6 +10081,18 @@ impl Render for Workspace {
         static FIRST_PAINT: AtomicBool = AtomicBool::new(true);
         if FIRST_PAINT.swap(false, std::sync::atomic::Ordering::Relaxed) {
             log::info!("Rendered first frame");
+        }
+
+        if self.is_restoring_layout() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .font(theme_settings::setup_ui_font(window, cx))
+                .text_color(cx.theme().colors().text)
+                .children(self.titlebar_item.clone())
+                .child(div().size_full().bg(cx.theme().colors().background))
+                .into_any_element();
         }
 
         let pad_center_pane = self.centered_layout
@@ -10065,6 +10596,7 @@ impl Render for Workspace {
                     })
                     .child(self.toast_layer.clone()),
             )
+            .into_any_element()
     }
 }
 
@@ -10251,42 +10783,72 @@ pub async fn last_session_workspace_locations(
 pub async fn restore_multiworkspace(
     multi_workspace: SerializedMultiWorkspace,
     app_state: Arc<AppState>,
+    env: Option<HashMap<String, String>>,
+    mut window_opened: Option<oneshot::Sender<WindowHandle<MultiWorkspace>>>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<WindowHandle<MultiWorkspace>> {
     let SerializedMultiWorkspace {
         active_workspace,
         state,
     } = multi_workspace;
+    let workspace_id = active_workspace.workspace_id;
 
-    let workspace_result = if active_workspace.paths.is_empty() {
-        cx.update(|cx| {
-            open_workspace_by_id(active_workspace.workspace_id, app_state.clone(), None, cx)
-        })
-        .await
+    let (created_tx, created_rx) = oneshot::channel();
+    let open_workspace = if active_workspace.paths.is_empty() {
+        Either::Left(cx.update(|cx| {
+            open_workspace_by_id_inner(workspace_id, app_state.clone(), None, Some(created_tx), cx)
+        }))
     } else {
-        cx.update(|cx| {
-            Workspace::new_local(
-                active_workspace.paths.paths().to_vec(),
-                app_state.clone(),
-                None,
-                None,
-                None,
-                OpenMode::Add,
-                cx,
-            )
-        })
-        .await
-        .map(|result| result.window)
+        Either::Right(
+            cx.update(|cx| {
+                Workspace::new_local_inner(
+                    active_workspace.paths.paths().to_vec(),
+                    app_state.clone(),
+                    None,
+                    env.clone(),
+                    None,
+                    OpenMode::Add,
+                    true,
+                    Some(created_tx),
+                    cx,
+                )
+            })
+            .map(|result| result.map(|result| result.window)),
+        )
+    };
+    let mut window_prepared = false;
+    let workspace_result = match select(open_workspace, created_rx).await {
+        Either::Left((result, _)) => result,
+        Either::Right((created, open_workspace)) => {
+            if let Ok(window) = created {
+                prepare_restored_window(
+                    window,
+                    workspace_id,
+                    &state,
+                    app_state.fs.clone(),
+                    window_opened.take(),
+                    cx,
+                )
+                .await;
+                window_prepared = true;
+            }
+            open_workspace.await
+        }
     };
 
     let window_handle = match workspace_result {
         Ok(handle) => {
-            restore_native_window_state(handle, active_workspace.workspace_id, cx);
-            handle
-                .update(cx, |_, window, _cx| {
-                    window.activate_window();
-                })
-                .ok();
+            if !window_prepared {
+                prepare_restored_window(
+                    handle,
+                    workspace_id,
+                    &state,
+                    app_state.fs.clone(),
+                    window_opened.take(),
+                    cx,
+                )
+                .await;
+            }
             handle
         }
         Err(err) => {
@@ -10302,7 +10864,7 @@ pub async fn restore_multiworkspace(
                             paths,
                             app_state.clone(),
                             None,
-                            None,
+                            env.clone(),
                             None,
                             OpenMode::Activate,
                             cx,
@@ -10320,17 +10882,20 @@ pub async fn restore_multiworkspace(
                 }
             }
 
-            fallback_handle.ok_or(err)?
+            let fallback_handle = fallback_handle.ok_or(err)?;
+            fallback_handle
+                .update(cx, |_, window, _cx| {
+                    window.activate_window();
+                })
+                .ok();
+            apply_restored_multiworkspace_state(fallback_handle, &state, app_state.fs.clone(), cx)
+                .await;
+            if let Some(window_opened) = window_opened.take() {
+                window_opened.send(fallback_handle).ok();
+            }
+            fallback_handle
         }
     };
-
-    apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
-
-    window_handle
-        .update(cx, |_, window, _cx| {
-            window.activate_window();
-        })
-        .ok();
 
     Ok(window_handle)
 }
@@ -10403,6 +10968,26 @@ pub async fn apply_restored_multiworkspace_state(
                 multi_workspace.serialize(cx);
             })
             .ok();
+    }
+}
+
+async fn prepare_restored_window(
+    window_handle: WindowHandle<MultiWorkspace>,
+    workspace_id: WorkspaceId,
+    state: &MultiWorkspaceState,
+    fs: Arc<dyn fs::Fs>,
+    window_opened: Option<oneshot::Sender<WindowHandle<MultiWorkspace>>>,
+    cx: &mut AsyncApp,
+) {
+    restore_native_window_state(window_handle, workspace_id, cx);
+    window_handle
+        .update(cx, |_, window, _cx| {
+            window.activate_window();
+        })
+        .ok();
+    apply_restored_multiworkspace_state(window_handle, state, fs, cx).await;
+    if let Some(window_opened) = window_opened {
+        window_opened.send(window_handle).ok();
     }
 }
 
@@ -10788,51 +11373,125 @@ pub async fn get_any_active_multi_workspace(
         })
         .await?;
     }
-    activate_any_workspace_window(&mut cx).context("could not open zed")
+    let restored_window = cx.update(|cx| {
+        let windows = cx
+            .windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<MultiWorkspace>())
+            .filter(|window| is_restored_workspace_window(*window, cx))
+            .collect::<Vec<_>>();
+        let active_window = cx
+            .active_window()
+            .and_then(|window| window.downcast::<MultiWorkspace>());
+        let restored_window = active_window
+            .filter(|window| windows.contains(window))
+            .or_else(|| windows.first().copied())?;
+        if Some(restored_window) != active_window {
+            restored_window
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
+        }
+        Some(restored_window)
+    });
+    if let Some(restored_window) = restored_window {
+        return Ok(restored_window);
+    }
+    let window = activate_any_workspace_window(&mut cx).context("could not open zed")?;
+    let restoration = window.read_with(&cx, |multi_workspace, cx| {
+        multi_workspace.workspace().read(cx).pending_restoration()
+    })?;
+    if let Some(restoration) = restoration {
+        restoration.await.ok();
+    }
+    Ok(window)
 }
 
 pub fn activate_any_workspace_window(cx: &mut AsyncApp) -> Option<WindowHandle<MultiWorkspace>> {
     cx.update(|cx| {
-        if let Some(workspace_window) = cx
+        let active_window = cx
             .active_window()
-            .and_then(|window| window.downcast::<MultiWorkspace>())
+            .and_then(|window| window.downcast::<MultiWorkspace>());
+        if let Some(active_window) = active_window
+            && is_ready_workspace_window(active_window, cx)
         {
-            return Some(workspace_window);
+            return Some(active_window);
         }
 
-        for window in cx.windows() {
-            if let Some(workspace_window) = window.downcast::<MultiWorkspace>() {
-                workspace_window
-                    .update(cx, |_, window, _| window.activate_window())
-                    .ok();
-                return Some(workspace_window);
-            }
+        let windows = cx
+            .windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<MultiWorkspace>())
+            .collect::<Vec<_>>();
+        let workspace_window = windows
+            .iter()
+            .copied()
+            .find(|window| is_ready_workspace_window(*window, cx))
+            .or(active_window.filter(|window| windows.contains(window)))
+            .or_else(|| windows.first().copied())?;
+        if Some(workspace_window) != active_window {
+            workspace_window
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
         }
-        None
+        Some(workspace_window)
     })
 }
 
-pub fn remote_locations_match(
-    left: &RemoteConnectionOptions,
-    right: &RemoteConnectionOptions,
-) -> bool {
-    match (left, right) {
-        (RemoteConnectionOptions::Ssh(_), RemoteConnectionOptions::Ssh(_)) => {
-            same_remote_connection_identity(Some(left), Some(right))
-        }
-        (RemoteConnectionOptions::Wsl(left), RemoteConnectionOptions::Wsl(right)) => {
-            // The WSL username is not consistently populated in the workspace location, so ignore it for now.
-            left.distro_name == right.distro_name
-        }
-        (RemoteConnectionOptions::Docker(left), RemoteConnectionOptions::Docker(right)) => {
-            left.container_id == right.container_id
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        (RemoteConnectionOptions::Mock(left), RemoteConnectionOptions::Mock(right)) => {
-            left.id == right.id
-        }
-        _ => false,
-    }
+pub fn active_restoring_workspace(
+    cx: &App,
+) -> Option<(WindowHandle<MultiWorkspace>, Entity<Workspace>)> {
+    let window = cx
+        .active_window()?
+        .downcast::<MultiWorkspace>()
+        .filter(|window| is_ready_workspace_window(*window, cx))?;
+    let workspace = window.read(cx).ok()?.workspace().clone();
+    workspace
+        .read(cx)
+        .pending_restoration()
+        .is_some()
+        .then_some((window, workspace))
+}
+
+pub fn has_ready_workspace_window(cx: &App) -> bool {
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+        .any(|window| is_restored_workspace_window(window, cx))
+}
+
+pub fn pending_workspace_restorations(cx: &App) -> Vec<Shared<oneshot::Receiver<()>>> {
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+        .filter_map(|window| {
+            window
+                .read(cx)
+                .ok()?
+                .workspace()
+                .read(cx)
+                .pending_restoration()
+        })
+        .collect()
+}
+
+fn is_restored_workspace_window(window: WindowHandle<MultiWorkspace>, cx: &App) -> bool {
+    is_ready_workspace_window(window, cx)
+        && window.read(cx).is_ok_and(|multi_workspace| {
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .pending_restoration()
+                .is_none()
+        })
+}
+
+fn is_ready_workspace_window(window: WindowHandle<MultiWorkspace>, cx: &App) -> bool {
+    window.read(cx).is_ok_and(|multi_workspace| {
+        !multi_workspace
+            .workspace()
+            .read(cx)
+            .is_remote_connection_placeholder
+    })
 }
 
 fn workspace_is_at_location(
@@ -10840,6 +11499,9 @@ fn workspace_is_at_location(
     location: &SerializedWorkspaceLocation,
     cx: &App,
 ) -> bool {
+    if workspace.read(cx).is_remote_connection_placeholder {
+        return false;
+    }
     let WorkspaceLocation::Location(workspace_location, _) =
         workspace.read(cx).workspace_location(cx)
     else {
@@ -10856,6 +11518,29 @@ fn workspace_is_at_location(
     }
 }
 
+pub fn remote_locations_match(
+    left: &RemoteConnectionOptions,
+    right: &RemoteConnectionOptions,
+) -> bool {
+    match (left, right) {
+        (RemoteConnectionOptions::Ssh(_), RemoteConnectionOptions::Ssh(_)) => {
+            same_remote_connection_identity(Some(left), Some(right))
+        }
+        (RemoteConnectionOptions::Wsl(left), RemoteConnectionOptions::Wsl(right)) => {
+            left.distro_name == right.distro_name
+                && (left.user.is_none() || right.user.is_none() || left.user == right.user)
+        }
+        (RemoteConnectionOptions::Docker(left), RemoteConnectionOptions::Docker(right)) => {
+            left.container_id == right.container_id
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        (RemoteConnectionOptions::Mock(left), RemoteConnectionOptions::Mock(right)) => {
+            left.id == right.id
+        }
+        _ => false,
+    }
+}
+
 pub fn workspace_windows_for_location(
     serialized_location: &SerializedWorkspaceLocation,
     cx: &App,
@@ -10865,10 +11550,9 @@ pub fn workspace_windows_for_location(
         .filter_map(|window| window.downcast::<MultiWorkspace>())
         .filter(|multi_workspace| {
             multi_workspace.read(cx).is_ok_and(|multi_workspace| {
-                !multi_workspace.is_remote_connection_placeholder
-                    && multi_workspace.workspaces().any(|workspace| {
-                        workspace_is_at_location(workspace, serialized_location, cx)
-                    })
+                multi_workspace
+                    .workspaces()
+                    .any(|workspace| workspace_is_at_location(workspace, serialized_location, cx))
             })
         })
         .collect()
@@ -10886,8 +11570,10 @@ pub async fn find_existing_workspace(
     let mut existing: Option<(WindowHandle<MultiWorkspace>, Entity<Workspace>)> = None;
     let mut open_visible = OpenVisible::All;
     let mut best_match = None;
+    let mut exact_roots_match = None;
 
     if open_options.workspace_matching != WorkspaceMatching::None {
+        let requested_roots = requested_roots(abs_paths);
         cx.update(|cx| {
             for window in workspace_windows_for_location(location, cx) {
                 if let Ok(multi_workspace) = window.read(cx) {
@@ -10896,6 +11582,12 @@ pub async fn find_existing_workspace(
                             continue;
                         }
 
+                        if open_options.restoring_session
+                            && exact_roots_match.is_none()
+                            && PathList::new(&workspace.read(cx).root_paths(cx)) == requested_roots
+                        {
+                            exact_roots_match = Some((window, workspace.clone()));
+                        }
                         let project = workspace.read(cx).project.read(cx);
                         let m = match open_options.workspace_matching {
                             WorkspaceMatching::None => None,
@@ -10922,6 +11614,9 @@ pub async fn find_existing_workspace(
                 }
             }
         });
+        if exact_roots_match.is_some() {
+            existing = exact_roots_match.clone();
+        }
 
         let all_paths_are_files = existing
             .as_ref()
@@ -10945,16 +11640,40 @@ pub async fn find_existing_workspace(
             })
             .unwrap_or(false);
 
-        if open_options.wait && existing.is_some() && all_paths_are_files {
+        if open_options.wait
+            && exact_roots_match.is_none()
+            && existing.is_some()
+            && all_paths_are_files
+        {
             cx.update(|cx| {
-                if let Some(workspace) = preferred_workspace_for_location(location, cx) {
-                    existing = Some(workspace);
-                    open_visible = OpenVisible::None;
+                let windows = workspace_windows_for_location(location, cx);
+                let window = cx
+                    .active_window()
+                    .and_then(|window| window.downcast::<MultiWorkspace>())
+                    .filter(|window| windows.contains(window))
+                    .or_else(|| windows.into_iter().next());
+                if let Some(window) = window {
+                    if let Ok(multi_workspace) = window.read(cx) {
+                        let active_workspace = multi_workspace.workspace().clone();
+                        existing = Some((window, active_workspace));
+                        open_visible = OpenVisible::None;
+                    }
                 }
             });
         }
     }
     (existing, open_visible)
+}
+
+pub fn requested_roots(abs_paths: &[PathBuf]) -> PathList {
+    let sorted_paths = PathList::new(abs_paths);
+    let mut roots = Vec::<&PathBuf>::new();
+    for path in sorted_paths.paths() {
+        if !roots.iter().any(|root| path.starts_with(root)) {
+            roots.push(path);
+        }
+    }
+    PathList::new(&roots)
 }
 
 /// Controls whether to reuse an existing workspace whose worktrees contain the
@@ -10991,6 +11710,7 @@ pub struct OpenOptions {
     pub open_mode: OpenMode,
     pub env: Option<HashMap<String, String>>,
     pub open_in_dev_container: bool,
+    pub restoring_session: bool,
 }
 
 impl Default for OpenOptions {
@@ -11005,6 +11725,7 @@ impl Default for OpenOptions {
             open_mode: OpenMode::default(),
             env: None,
             open_in_dev_container: false,
+            restoring_session: false,
         }
     }
 }
@@ -11031,6 +11752,16 @@ pub fn open_workspace_by_id(
     workspace_id: WorkspaceId,
     app_state: Arc<AppState>,
     requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    cx: &mut App,
+) -> Task<anyhow::Result<WindowHandle<MultiWorkspace>>> {
+    open_workspace_by_id_inner(workspace_id, app_state, requesting_window, None, cx)
+}
+
+fn open_workspace_by_id_inner(
+    workspace_id: WorkspaceId,
+    app_state: Arc<AppState>,
+    requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    window_opened: Option<oneshot::Sender<WindowHandle<MultiWorkspace>>>,
     cx: &mut App,
 ) -> Task<anyhow::Result<WindowHandle<MultiWorkspace>>> {
     let project_handle = Project::local(
@@ -11119,14 +11850,24 @@ pub fn open_workspace_by_id(
 
             (window, workspace)
         };
+        if let Some(window_opened) = window_opened {
+            window_opened.send(window).ok();
+        }
 
         notify_if_database_failed(window, cx);
 
         // Restore items from the serialized workspace
         window
             .update(cx, |_, window, cx| {
-                workspace.update(cx, |_workspace, cx| {
-                    open_items(Some(serialized_workspace), vec![], window, cx)
+                workspace.update(cx, |workspace, cx| {
+                    open_items(
+                        workspace,
+                        Some(serialized_workspace),
+                        Vec::new(),
+                        true,
+                        window,
+                        cx,
+                    )
                 })
             })?
             .await?;
@@ -11174,12 +11915,21 @@ pub fn open_paths(
 
             if all_metadatas.into_iter().all(|file| !file.is_dir) {
                 cx.update(|cx| {
-                    if let Some(workspace) = preferred_workspace_for_location(
+                    let windows = workspace_windows_for_location(
                         &SerializedWorkspaceLocation::Local,
                         cx,
-                    ) {
-                        existing = Some(workspace);
-                        open_visible = OpenVisible::None;
+                    );
+                    let window = cx
+                        .active_window()
+                        .and_then(|window| window.downcast::<MultiWorkspace>())
+                        .filter(|window| windows.contains(window))
+                        .or_else(|| windows.into_iter().next());
+                    if let Some(window) = window {
+                        if let Ok(multi_workspace) = window.read(cx) {
+                            let active_workspace = multi_workspace.workspace().clone();
+                            existing = Some((window, active_workspace));
+                            open_visible = OpenVisible::None;
+                        }
                     }
                 });
             }
@@ -11235,6 +11985,10 @@ pub fn open_paths(
         }
 
         let open_in_dev_container = open_options.open_in_dev_container;
+        let session_restore_env = open_options
+            .env
+            .clone()
+            .filter(|_| open_options.restoring_session);
 
         let result = if let Some((existing, target_workspace)) = existing {
             let open_task = existing
@@ -11244,6 +11998,13 @@ pub fn open_paths(
                     target_workspace.update(cx, |workspace, cx| {
                         if open_in_dev_container {
                             workspace.set_open_in_dev_container(true);
+                        }
+                        if let Some(env) = session_restore_env
+                            && workspace.contains_requested_paths(&abs_paths, cx)
+                        {
+                            workspace.project().update(cx, |project, cx| {
+                                project.set_cli_environment_if_unset(env, cx)
+                            });
                         }
                         workspace.open_paths(
                             abs_paths,
@@ -11422,6 +12183,7 @@ pub fn open_remote_project_with_new_connection(
     delegate: Arc<dyn RemoteClientDelegate>,
     app_state: Arc<AppState>,
     paths: Vec<PathBuf>,
+    restoring_session: bool,
     cx: &mut App,
 ) -> Task<Result<(Option<Entity<Workspace>>, Vec<Option<Box<dyn ItemHandle>>>)>> {
     cx.spawn(async move |cx| {
@@ -11467,6 +12229,7 @@ pub fn open_remote_project_with_new_connection(
             window,
             None,
             None,
+            restoring_session,
             cx,
         )
         .await?;
@@ -11485,6 +12248,7 @@ pub fn open_remote_project_with_existing_connection(
     cx: &mut AsyncApp,
 ) -> Task<Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)>> {
     cx.spawn(async move |cx| {
+        window.update(cx, |_, window, _| window.activate_window())?;
         let (workspace_id, serialized_workspace) =
             deserialize_remote_project(connection_options.clone(), paths.clone(), cx).await?;
 
@@ -11497,6 +12261,7 @@ pub fn open_remote_project_with_existing_connection(
             window,
             provisional_project_group_key,
             source_workspace,
+            false,
             cx,
         )
         .await
@@ -11512,6 +12277,7 @@ async fn open_remote_project_inner(
     window: WindowHandle<MultiWorkspace>,
     provisional_project_group_key: Option<ProjectGroupKey>,
     source_workspace: Option<WeakEntity<Workspace>>,
+    restoring_session: bool,
     cx: &mut AsyncApp,
 ) -> Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)> {
     let mut project_paths_to_open = vec![];
@@ -11537,6 +12303,7 @@ async fn open_remote_project_inner(
         return Err(project_path_errors.pop().context("no paths given")?);
     }
 
+    let mut _restoring_layout = None;
     let workspace = window.update(cx, |multi_workspace, window, cx| {
         let new_workspace = cx.new(|cx| {
             let mut workspace = Workspace::new(
@@ -11550,6 +12317,7 @@ async fn open_remote_project_inner(
 
             if let Some(ref serialized) = serialized_workspace {
                 workspace.centered_layout = serialized.centered_layout;
+                _restoring_layout = Some(workspace.begin_restoring_layout(serialized));
             }
 
             workspace
@@ -11593,8 +12361,15 @@ async fn open_remote_project_inner(
 
     let items = window
         .update(cx, |_, window, cx| {
-            workspace.update(cx, |_workspace, cx| {
-                open_items(serialized_workspace, project_paths_to_open, window, cx)
+            workspace.update(cx, |workspace, cx| {
+                open_items(
+                    workspace,
+                    serialized_workspace,
+                    project_paths_to_open,
+                    restoring_session,
+                    window,
+                    cx,
+                )
             })
         })?
         .await?;
@@ -11615,23 +12390,6 @@ async fn open_remote_project_inner(
         workspace,
         items.into_iter().map(|item| item?.ok()).collect(),
     ))
-}
-
-fn preferred_workspace_for_location(
-    location: &SerializedWorkspaceLocation,
-    cx: &App,
-) -> Option<(WindowHandle<MultiWorkspace>, Entity<Workspace>)> {
-    let windows = workspace_windows_for_location(location, cx);
-    let window = cx
-        .active_window()
-        .and_then(|window| window.downcast::<MultiWorkspace>())
-        .filter(|window| windows.contains(window))
-        .or_else(|| windows.into_iter().next())?;
-    let multi_workspace = window.read(cx).ok()?;
-    let workspace = std::iter::once(multi_workspace.workspace())
-        .chain(multi_workspace.workspaces())
-        .find(|workspace| workspace_is_at_location(workspace, location, cx))?;
-    Some((window, workspace.clone()))
 }
 
 fn deserialize_remote_project(
@@ -12396,31 +13154,42 @@ pub fn with_active_or_new_workspace(
     cx: &mut App,
     f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send + 'static,
 ) {
-    match cx
-        .active_window()
-        .and_then(|w| w.downcast::<MultiWorkspace>())
-    {
-        Some(multi_workspace) => {
-            cx.defer(move |cx| {
+    cx.defer(move |cx| {
+        let active_window = cx
+            .active_window()
+            .and_then(|window| window.downcast::<MultiWorkspace>())
+            .filter(|window| is_ready_workspace_window(*window, cx));
+        let target_window = active_window.or_else(|| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+                .find(|window| is_ready_workspace_window(*window, cx))
+        });
+        match target_window {
+            Some(multi_workspace) => {
+                let activate = active_window.is_none();
                 multi_workspace
                     .update(cx, |multi_workspace, window, cx| {
+                        if activate {
+                            window.activate_window();
+                        }
                         let workspace = multi_workspace.workspace().clone();
                         workspace.update(cx, |workspace, cx| f(workspace, window, cx));
                     })
                     .log_err();
-            });
+            }
+            None => {
+                let app_state = AppState::global(cx);
+                open_new(
+                    OpenOptions::default(),
+                    app_state,
+                    cx,
+                    move |workspace, window, cx| f(workspace, window, cx),
+                )
+                .detach_and_log_err(cx);
+            }
         }
-        None => {
-            let app_state = AppState::global(cx);
-            open_new(
-                OpenOptions::default(),
-                app_state,
-                cx,
-                move |workspace, window, cx| f(workspace, window, cx),
-            )
-            .detach_and_log_err(cx);
-        }
-    }
+    });
 }
 
 /// Reads a panel's pixel size from its legacy KVP format and deletes the legacy
@@ -13416,40 +14185,104 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[gpui::test]
     async fn test_close_window_without_worktrees_prompts(cx: &mut TestAppContext) {
+        for roots in [&[][..], &["/root/one"]] {
+            let cx = &mut cx.new_app();
+            init_test(cx);
+
+            cx.update(|cx| {
+                register_serializable_item::<TestItem>(cx);
+            });
+
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree("/root", json!({ "one": "" })).await;
+            let project = Project::test(fs, roots.iter().map(Path::new), cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+            let item = cx.new(|cx| {
+                TestItem::new(cx)
+                    .with_dirty(true)
+                    .with_serialize(|| Some(Task::ready(Ok(()))))
+            });
+            workspace.update_in(cx, |w, window, cx| {
+                w.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            });
+
+            let task = workspace.update_in(cx, |w, window, cx| {
+                w.prepare_to_close(CloseIntent::CloseWindow, window, cx)
+            });
+            cx.executor().run_until_parked();
+
+            assert!(
+                cx.has_pending_prompt(),
+                "closing a workspace without folders ({roots:?}) with a dirty serializable item \
+                 should prompt, since the workspace will not be reachable after close"
+            );
+            cx.simulate_prompt_answer("Don't Save");
+            cx.executor().run_until_parked();
+
+            assert!(task.await.unwrap());
+        }
+    }
+
+    #[gpui::test]
+    async fn test_with_active_or_new_workspace_skips_connection_placeholder(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
-
-        cx.update(|cx| {
-            register_serializable_item::<TestItem>(cx);
-        });
-
         let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, None, cx).await;
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
-
-        let item = cx.new(|cx| {
-            TestItem::new(cx)
-                .with_dirty(true)
-                .with_serialize(|| Some(Task::ready(Ok(()))))
+        let ready_project = Project::test(fs.clone(), [], cx).await;
+        let placeholder_project = Project::test(fs, [], cx).await;
+        let ready_window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(ready_project, window, cx));
+        let placeholder_window = cx.add_window(|window, cx| {
+            let multi_workspace = MultiWorkspace::test_new(placeholder_project, window, cx);
+            multi_workspace.workspace().update(cx, |workspace, _| {
+                workspace.set_remote_connection_placeholder(true)
+            });
+            multi_workspace
         });
-        workspace.update_in(cx, |w, window, cx| {
-            w.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
-        });
+        placeholder_window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        let ready_workspace = ready_window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspace().entity_id()
+            })
+            .unwrap();
 
-        let task = workspace.update_in(cx, |w, window, cx| {
-            w.prepare_to_close(CloseIntent::CloseWindow, window, cx)
+        let targeted_workspace = Arc::new(std::sync::Mutex::new(None));
+        cx.update(|cx| {
+            let targeted_workspace = targeted_workspace.clone();
+            with_active_or_new_workspace(cx, move |_, _, cx| {
+                *targeted_workspace.lock().unwrap() = Some(cx.entity_id());
+            });
         });
-        cx.executor().run_until_parked();
+        cx.run_until_parked();
 
-        assert!(
-            cx.has_pending_prompt(),
-            "closing a no-folder workspace with a dirty serializable item should prompt, \
-             since the workspace will not be reachable after close"
+        assert_eq!(
+            (*targeted_workspace.lock().unwrap(), cx.windows().len()),
+            (Some(ready_workspace), 2)
         );
-        cx.simulate_prompt_answer("Don't Save");
-        cx.executor().run_until_parked();
+    }
 
-        assert!(task.await.unwrap());
+    #[test]
+    fn test_wsl_locations_match_unless_users_differ() {
+        let wsl = |user: Option<&str>| {
+            RemoteConnectionOptions::Wsl(remote::WslConnectionOptions {
+                distro_name: "Ubuntu".to_owned(),
+                user: user.map(str::to_owned),
+            })
+        };
+        assert_eq!(
+            [
+                (None, Some("root")),
+                (Some("root"), Some("root")),
+                (Some("root"), Some("alice")),
+            ]
+            .map(|(left, right)| remote_locations_match(&wsl(left), &wsl(right))),
+            [true, true, false]
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -18437,6 +19270,7 @@ mod tests {
     mod register_project_item_tests {
 
         use super::*;
+        use crate::item::test::PendingTestItemDeserialization;
 
         // View
         struct TestPngItemView {
@@ -18451,11 +19285,19 @@ mod tests {
 
         impl project::ProjectItem for TestPngItem {
             fn try_open(
-                _project: &Entity<Project>,
+                project: &Entity<Project>,
                 path: &ProjectPath,
                 cx: &mut App,
             ) -> Option<Task<anyhow::Result<Entity<Self>>>> {
-                if path.path.extension().unwrap() == "png" {
+                let is_png = project
+                    .read(cx)
+                    .absolute_path(path, cx)
+                    .is_some_and(|abs_path| {
+                        abs_path
+                            .extension()
+                            .is_some_and(|extension| extension == "png")
+                    });
+                if is_png {
                     let project_path = path.clone();
                     Some(cx.spawn(async move |cx| Ok(cx.new(|_| TestPngItem { project_path }))))
                 } else {
@@ -18923,6 +19765,383 @@ mod tests {
                 })
                 .await;
             assert!(handle.is_err());
+        }
+
+        #[gpui::test]
+        async fn test_session_restore_reopens_only_open_unserializable_root_files(
+            cx: &mut TestAppContext,
+        ) {
+            let mut restored_root_files = Vec::new();
+            for root_file_tab in ["open", "active", "closed", "invalid"] {
+                let cx = &mut cx.new_app();
+                let (png_count, png_active) = restored_root_files_state(root_file_tab, cx).await;
+                restored_root_files.push((root_file_tab, png_count, png_active));
+            }
+            assert_eq!(
+                restored_root_files,
+                vec![
+                    ("open", 1, false),
+                    ("active", 1, true),
+                    ("closed", 0, false),
+                    ("invalid", 1, false)
+                ]
+            );
+        }
+
+        #[gpui::test]
+        async fn test_contains_requested_paths(cx: &mut TestAppContext) {
+            init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                path!("/repo"),
+                json!({ "subdir": { "file.txt": "" }, "file.txt": "" }),
+            )
+            .await;
+            let project = Project::test(fs, [path!("/repo").as_ref()], cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+            let contains = workspace.read_with(cx, |workspace, cx| {
+                [
+                    vec![path!("/repo/subdir")],
+                    vec![path!("/repo/subdir/file.txt"), path!("/repo/new.txt")],
+                    vec![path!("/other/file.txt")],
+                    vec![path!("/repo/file.txt"), path!("/other/file.txt")],
+                ]
+                .into_iter()
+                .map(|paths| {
+                    workspace.contains_requested_paths(
+                        &paths.into_iter().map(PathBuf::from).collect::<Vec<_>>(),
+                        cx,
+                    )
+                })
+                .collect::<Vec<_>>()
+            });
+            assert_eq!(contains, vec![true, true, false, false]);
+        }
+
+        #[gpui::test]
+        async fn test_open_paths_waits_for_workspace_restoration(cx: &mut TestAppContext) {
+            init_test(cx);
+            cx.update(|cx| {
+                register_project_item::<TestPngItemView>(cx);
+                register_serializable_item::<TestItem>(cx);
+            });
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/root"), json!({ "one.png": "" }))
+                .await;
+            let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+            let (multi_workspace, cx) =
+                cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+            let workspace = multi_workspace
+                .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+            let (unblock_deserialization, pending_deserialization) = oneshot::channel();
+            cx.update(|_, cx| {
+                cx.set_global(PendingTestItemDeserialization {
+                    finished: pending_deserialization.shared(),
+                    item_ids: None,
+                })
+            });
+
+            let restore = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.load_workspace(restoring_test_workspace(), Vec::new(), window, cx)
+            });
+            let open = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_paths(
+                    vec![PathBuf::from(path!("/root/one.png"))],
+                    OpenOptions::default(),
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            let open_path = workspace.update_in(cx, |workspace, window, cx| {
+                let worktree = workspace.project().read(cx).worktrees(cx).next().unwrap();
+                let worktree_id = worktree.read(cx).id();
+                workspace.open_path((worktree_id, rel_path("one.png")), None, true, window, cx)
+            });
+            cx.run_until_parked();
+            let png_items_during_restoration = workspace.read_with(cx, |workspace, cx| {
+                workspace.items_of_type::<TestPngItemView>(cx).count()
+            });
+
+            drop(unblock_deserialization);
+            restore.await.unwrap();
+            let mut opened_item_ids = open
+                .await
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|item| item.item_id())
+                .collect::<Vec<_>>();
+            opened_item_ids.push(open_path.await.unwrap().item_id());
+            let png_item_id = workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .items_of_type::<TestPngItemView>(cx)
+                    .map(|item| item.entity_id())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                (png_items_during_restoration, opened_item_ids),
+                (0, [png_item_id.clone(), png_item_id].concat())
+            );
+        }
+
+        #[gpui::test]
+        async fn test_restarted_restoration_keeps_deferred_actions(cx: &mut TestAppContext) {
+            init_test(cx);
+            cx.update(|cx| register_serializable_item::<TestItem>(cx));
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/root"), json!({})).await;
+            let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+            let (multi_workspace, cx) =
+                cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+            let workspace = multi_workspace
+                .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+            let action_ran = Rc::new(Cell::new(false));
+
+            let first_restoration = workspace.update_in(cx, |workspace, window, cx| {
+                let first_restoration =
+                    workspace.begin_restoring_layout(&restoring_test_workspace());
+                workspace.after_restoration(window, cx, {
+                    let action_ran = action_ran.clone();
+                    move |_, _, _| action_ran.set(true)
+                });
+                first_restoration
+            });
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.load_workspace(restoring_test_workspace(), Vec::new(), window, cx)
+                })
+                .await
+                .unwrap();
+            cx.run_until_parked();
+            let ran_before_first_restoration_ended = action_ran.get();
+            drop(first_restoration);
+            cx.run_until_parked();
+            assert_eq!(
+                (ran_before_first_restoration_ended, action_ran.get()),
+                (false, true)
+            );
+        }
+
+        #[gpui::test]
+        async fn test_restoration_keeps_active_incoming_tab(cx: &mut TestAppContext) {
+            init_test(cx);
+            cx.update(|cx| register_serializable_item::<TestItem>(cx));
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/root"), json!({})).await;
+            let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+            let (multi_workspace, cx) =
+                cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+            let workspace = multi_workspace
+                .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+            let (unblock_deserialization, pending_deserialization) = oneshot::channel();
+            cx.update(|_, cx| {
+                cx.set_global(PendingTestItemDeserialization {
+                    finished: pending_deserialization.shared(),
+                    item_ids: None,
+                })
+            });
+
+            let restore = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.load_workspace(restoring_test_workspace(), Vec::new(), window, cx)
+            });
+            let (first, second) = workspace.update_in(cx, |workspace, window, cx| {
+                let first = cx.new(TestItem::new);
+                let second = cx.new(TestItem::new);
+                for item in [&first, &second] {
+                    workspace.add_item_to_active_pane(
+                        Box::new(item.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                }
+                workspace.activate_item(&first, true, true, window, cx);
+                (first.entity_id(), second.entity_id())
+            });
+            drop(unblock_deserialization);
+            restore.await.unwrap();
+
+            let (item_ids, active_item_id) = workspace.read_with(cx, |workspace, cx| {
+                let pane = workspace.active_pane().read(cx);
+                (
+                    pane.items().map(|item| item.item_id()).collect::<Vec<_>>(),
+                    pane.active_item().map(|item| item.item_id()),
+                )
+            });
+            assert_eq!(
+                (item_ids[1..].to_vec(), active_item_id),
+                (vec![first, second], Some(first))
+            );
+        }
+
+        fn restoring_test_workspace() -> SerializedWorkspace {
+            SerializedWorkspace {
+                id: WorkspaceId::from_i64(1),
+                location: SerializedWorkspaceLocation::Local,
+                paths: PathList::new(&[path!("/root")]),
+                identity_paths: None,
+                center_group: SerializedPaneGroup::Pane(SerializedPane::new(
+                    vec![SerializedItem::new("TestItem", 1, true, false)],
+                    true,
+                    0,
+                )),
+                window_bounds: None,
+                centered_layout: false,
+                display: None,
+                docks: DockStructure::default(),
+                session_id: None,
+                bookmarks: BTreeMap::default(),
+                breakpoints: BTreeMap::default(),
+                user_toolchains: BTreeMap::default(),
+                recent_navigation_history: Vec::new(),
+                unserialized_root_files: None,
+                window_id: None,
+            }
+        }
+
+        async fn restored_root_files_state(
+            root_file_tab: &str,
+            cx: &mut TestAppContext,
+        ) -> (usize, bool) {
+            init_test(cx);
+            cx.update(|cx| {
+                cx.set_global(db::AppDatabase::test_new());
+                register_project_item::<TestPngItemView>(cx);
+                register_serializable_item::<TestItem>(cx);
+            });
+            let app_state = cx.update(AppState::test);
+            let fs = app_state.fs.as_fake();
+            fs.insert_tree(path!("/project"), json!({})).await;
+            fs.insert_tree(path!("/notes"), json!({ "one.png": "" }))
+                .await;
+            let roots = [path!("/project"), path!("/notes/one.png")];
+
+            let OpenResult { window, .. } = cx
+                .update(|cx| {
+                    Workspace::new_local(
+                        roots.iter().map(PathBuf::from).collect(),
+                        app_state.clone(),
+                        None,
+                        None,
+                        None,
+                        OpenMode::NewWindow,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            if root_file_tab != "open" && root_file_tab != "active" {
+                window
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.workspace().update(cx, |workspace, cx| {
+                            let png_item_id = workspace
+                                .items_of_type::<TestPngItemView>(cx)
+                                .next()
+                                .unwrap()
+                                .entity_id();
+                            workspace.active_pane().update(cx, |pane, cx| {
+                                pane.close_item_by_id(png_item_id, SaveIntent::Close, window, cx)
+                            })
+                        })
+                    })
+                    .unwrap()
+                    .await
+                    .unwrap();
+            }
+            if root_file_tab == "invalid" {
+                window
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.workspace().update(cx, |workspace, cx| {
+                            let invalid_item = cx.new(|cx| {
+                                InvalidItemView::new(
+                                    Path::new(path!("/notes/one.png")),
+                                    true,
+                                    &anyhow!("broken image"),
+                                    window,
+                                    cx,
+                                )
+                            });
+                            workspace.add_item_to_active_pane(
+                                Box::new(invalid_item),
+                                None,
+                                true,
+                                window,
+                                cx,
+                            );
+                        })
+                    })
+                    .unwrap();
+            }
+            let (workspace_id, flush) = window
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.workspace().update(cx, |workspace, cx| {
+                        workspace.add_item_to_active_pane(
+                            Box::new(cx.new(TestItem::new)),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                        if root_file_tab == "active" {
+                            let png_item = workspace
+                                .items_of_type::<TestPngItemView>(cx)
+                                .next()
+                                .unwrap();
+                            workspace.activate_item(&png_item, true, true, window, cx);
+                        }
+                        (
+                            workspace.database_id().unwrap(),
+                            workspace.flush_serialization(window, cx),
+                        )
+                    })
+                })
+                .unwrap();
+            flush.await;
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+
+            let restored_window = cx
+                .spawn({
+                    let app_state = app_state.clone();
+                    async move |mut cx| {
+                        restore_multiworkspace(
+                            SerializedMultiWorkspace {
+                                active_workspace: SessionWorkspace {
+                                    workspace_id,
+                                    location: SerializedWorkspaceLocation::Local,
+                                    paths: PathList::new(&roots),
+                                    window_id: None,
+                                },
+                                state: MultiWorkspaceState::default(),
+                            },
+                            app_state,
+                            None,
+                            None,
+                            &mut cx,
+                        )
+                        .await
+                    }
+                })
+                .await
+                .unwrap();
+            cx.run_until_parked();
+
+            restored_window
+                .read_with(cx, |multi_workspace, cx| {
+                    let workspace = multi_workspace.workspace().read(cx);
+                    (
+                        workspace.items_of_type::<TestPngItemView>(cx).count(),
+                        workspace
+                            .active_item(cx)
+                            .is_some_and(|item| item.downcast::<TestPngItemView>().is_some()),
+                    )
+                })
+                .unwrap()
         }
     }
 
@@ -19728,8 +20947,8 @@ mod tests {
             workspace.persisted_recent_navigation_history.clear();
         });
         workspace
-            .update_in(cx, |_, window, cx| {
-                Workspace::load_workspace(serialized_workspace, Vec::new(), window, cx)
+            .update_in(cx, |workspace, window, cx| {
+                workspace.load_workspace(serialized_workspace, Vec::new(), window, cx)
             })
             .await
             .unwrap();

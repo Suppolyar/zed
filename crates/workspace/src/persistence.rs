@@ -51,7 +51,7 @@ use crate::{
 
 use model::{
     GroupId, ItemId, PaneId, RemoteConnectionId, SerializedItem, SerializedPane,
-    SerializedPaneGroup, SerializedWorkspace,
+    SerializedPaneGroup, SerializedWorkspace, UnserializedRootFiles,
 };
 
 use self::model::{DockStructure, SerializedWorkspaceLocation, SessionWorkspace};
@@ -65,6 +65,28 @@ fn parse_timestamp(text: &str) -> DateTime<Utc> {
     NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
         .map(|naive| naive.and_utc())
         .unwrap_or_else(|_| Utc::now())
+}
+
+fn is_git_message_file(path: &Path) -> bool {
+    const GIT_MESSAGE_FILES: [&str; 8] = [
+        "COMMIT_EDITMSG",
+        "MERGE_MSG",
+        "SQUASH_MSG",
+        "TAG_EDITMSG",
+        "NOTES_EDITMSG",
+        "EDIT_DESCRIPTION",
+        "git-rebase-todo",
+        "addp-hunk-edit.diff",
+    ];
+    path.file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| GIT_MESSAGE_FILES.contains(&file_name))
+        && path.ancestors().skip(1).any(|directory| {
+            directory
+                .file_name()
+                .and_then(|directory_name| directory_name.to_str())
+                .is_some_and(|directory_name| directory_name.ends_with(".git"))
+        })
 }
 
 fn contains_wsl_path(paths: &PathList) -> bool {
@@ -1065,6 +1087,33 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE workspaces ADD COLUMN native_window_state BLOB;
         ),
+        sql!(
+            CREATE TABLE items_2(
+                item_id INTEGER NOT NULL,
+                workspace_id INTEGER NOT NULL,
+                pane_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                active INTEGER NOT NULL,
+                preview INTEGER,
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE,
+                FOREIGN KEY(pane_id) REFERENCES panes(pane_id)
+                ON DELETE CASCADE,
+                PRIMARY KEY(item_id, workspace_id, kind)
+            ) STRICT;
+            INSERT INTO items_2(item_id, workspace_id, pane_id, kind, position, active, preview)
+                SELECT item_id, workspace_id, pane_id, kind, position, active, preview FROM items;
+            DROP TABLE items;
+            ALTER TABLE items_2 RENAME TO items;
+        ),
+        sql!(
+            ALTER TABLE workspaces ADD COLUMN unserialized_root_files TEXT;
+        ),
+        sql!(
+            ALTER TABLE workspaces ADD COLUMN active_unserialized_root_file BLOB;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1217,6 +1266,7 @@ impl WorkspaceDb {
             window_id,
             user_toolchains: self.user_toolchains(workspace_id, remote_connection_id),
             recent_navigation_history: self.recent_navigation_history(workspace_id),
+            unserialized_root_files: self.unserialized_root_files(workspace_id),
         })
     }
 
@@ -1322,6 +1372,27 @@ impl WorkspaceDb {
             window_id,
             user_toolchains: self.user_toolchains(workspace_id, remote_connection_id),
             recent_navigation_history: self.recent_navigation_history(workspace_id),
+            unserialized_root_files: self.unserialized_root_files(workspace_id),
+        })
+    }
+
+    fn unserialized_root_files(&self, workspace_id: WorkspaceId) -> Option<UnserializedRootFiles> {
+        let (paths, active) = self
+            .select_row_bound::<WorkspaceId, (Option<String>, Option<PathBuf>)>(sql!(
+                SELECT unserialized_root_files, active_unserialized_root_file
+                FROM workspaces
+                WHERE workspace_id = ?
+            ))
+            .and_then(|mut statement| statement(workspace_id))
+            .context("Loading unserialized root files")
+            .log_err()
+            .flatten()?;
+        Some(UnserializedRootFiles {
+            paths: PathList::deserialize(&SerializedPathList {
+                paths: paths?,
+                order: String::new(),
+            }),
+            active,
         })
     }
 
@@ -1626,9 +1697,11 @@ impl WorkspaceDb {
                         bottom_dock_zoom,
                         session_id,
                         window_id,
+                        unserialized_root_files,
+                        active_unserialized_root_file,
                         timestamp
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, CURRENT_TIMESTAMP)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, CURRENT_TIMESTAMP)
                     ON CONFLICT DO
                     UPDATE SET
                         paths = ?2,
@@ -1647,6 +1720,8 @@ impl WorkspaceDb {
                         bottom_dock_zoom = ?15,
                         session_id = ?16,
                         window_id = ?17,
+                        unserialized_root_files = ?18,
+                        active_unserialized_root_file = ?19,
                         timestamp = CURRENT_TIMESTAMP
                 );
                 let mut prepared_query = conn.exec_bound(query)?;
@@ -1660,6 +1735,12 @@ impl WorkspaceDb {
                     workspace.docks,
                     workspace.session_id,
                     workspace.window_id,
+                    workspace.unserialized_root_files.as_ref().map(|root_files| {
+                        (
+                            root_files.paths.serialize().paths,
+                            root_files.active.as_deref(),
+                        )
+                    }),
                 );
 
                 prepared_query(args).context("Updating workspace")?;
@@ -2042,19 +2123,24 @@ impl WorkspaceDb {
         }
     }
 
+    async fn restorable_in_session(paths: &[PathBuf], fs: &dyn Fs) -> bool {
+        match Self::existing_paths_include_a_directory(paths, fs).await {
+            Some(true) => true,
+            Some(false) => !paths.iter().all(|path| is_git_message_file(path)),
+            None => false,
+        }
+    }
+
     async fn all_paths_exist_with_a_directory(paths: &[PathBuf], fs: &dyn Fs) -> bool {
+        Self::existing_paths_include_a_directory(paths, fs).await == Some(true)
+    }
+
+    async fn existing_paths_include_a_directory(paths: &[PathBuf], fs: &dyn Fs) -> Option<bool> {
         let mut any_dir = false;
         for path in paths {
-            match fs.metadata(path).await.ok().flatten() {
-                None => return false,
-                Some(meta) => {
-                    if meta.is_dir {
-                        any_dir = true;
-                    }
-                }
-            }
+            any_dir |= fs.metadata(path).await.ok().flatten()?.is_dir;
         }
-        any_dir
+        Some(any_dir)
     }
 
     // Returns the raw recent workspace history. Scratch workspaces (no paths) are filtered
@@ -2233,26 +2319,23 @@ impl WorkspaceDb {
         {
             let window_id = window_id.map(WindowId::from);
 
-            if let Some(remote_connection_id) = remote_connection_id {
-                workspaces.push(SessionWorkspace {
-                    workspace_id,
-                    location: SerializedWorkspaceLocation::Remote(
-                        self.remote_connection(remote_connection_id)?,
-                    ),
-                    paths,
-                    window_id,
-                });
-                continue;
-            }
-
-            if paths.is_empty() || Self::all_paths_exist_with_a_directory(paths.paths(), fs).await {
-                workspaces.push(SessionWorkspace {
-                    workspace_id,
-                    location: SerializedWorkspaceLocation::Local,
-                    paths,
-                    window_id,
-                });
-            }
+            let location = match remote_connection_id {
+                Some(remote_connection_id) => SerializedWorkspaceLocation::Remote(
+                    self.remote_connection(remote_connection_id)?,
+                ),
+                None => {
+                    if !paths.is_empty() && !Self::restorable_in_session(paths.paths(), fs).await {
+                        continue;
+                    }
+                    SerializedWorkspaceLocation::Local
+                }
+            };
+            workspaces.push(SessionWorkspace {
+                workspace_id,
+                location,
+                paths,
+                window_id,
+            });
         }
 
         if let Some(stack) = last_session_window_stack {
@@ -2505,7 +2588,7 @@ impl WorkspaceDb {
     }
 
     query! {
-        pub(crate) async fn set_session_binding(workspace_id: WorkspaceId, session_id: Option<String>, window_id: Option<u64>) -> Result<()> {
+        pub async fn set_session_binding(workspace_id: WorkspaceId, session_id: Option<String>, window_id: Option<u64>) -> Result<()> {
             UPDATE workspaces
             SET session_id = ?2, window_id = ?3
             WHERE workspace_id = ?1
@@ -2812,6 +2895,7 @@ mod tests {
     use crate::ProjectGroupKey;
     use crate::RemovalIntent;
     use crate::{
+        item::test::TestItem,
         multi_workspace::MultiWorkspace,
         persistence::{
             model::{
@@ -2821,6 +2905,7 @@ mod tests {
             read_multi_workspace_state,
         },
     };
+    use futures::{FutureExt as _, channel::oneshot};
     use gpui::TaskExt;
 
     use gpui::AppContext as _;
@@ -2828,7 +2913,7 @@ mod tests {
     use project::Project;
     use remote::SshConnectionOptions;
     use serde_json::json;
-    use std::{thread, time::Duration};
+    use std::{cell::Cell, rc::Rc, thread, time::Duration};
 
     /// Creates a unique directory in a FakeFs, returning the path.
     /// Uses a UUID suffix to avoid collisions with other tests sharing the global DB.
@@ -3016,6 +3101,7 @@ mod tests {
             window_id: None,
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         db.save_workspace(workspace.clone()).await;
@@ -3140,6 +3226,7 @@ mod tests {
             window_id: None,
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         db.save_workspace(workspace.clone()).await;
@@ -3177,6 +3264,7 @@ mod tests {
             window_id: None,
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         db.save_workspace(workspace_without_breakpoint.clone())
@@ -3268,6 +3356,7 @@ mod tests {
             window_id: None,
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         })
         .await;
         assert_eq!(db.native_window_state(id).unwrap(), Some((None, None)));
@@ -3350,6 +3439,7 @@ mod tests {
             window_id: None,
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         let workspace_2 = SerializedWorkspace {
@@ -3368,6 +3458,7 @@ mod tests {
             window_id: None,
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         db.save_workspace(workspace_1.clone()).await;
@@ -3480,6 +3571,10 @@ mod tests {
             recent_navigation_history: (0..20)
                 .map(|index| PathBuf::from(format!("/tmp2/src/{index}.rs")))
                 .collect(),
+            unserialized_root_files: Some(UnserializedRootFiles {
+                paths: PathList::new(&["/tmp3/one.png", "/tmp4/two.png"]),
+                active: Some(PathBuf::from("/tmp4/two.png")),
+            }),
         };
 
         db.save_workspace(workspace.clone()).await;
@@ -3520,6 +3615,7 @@ mod tests {
             window_id: Some(1),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         let mut workspace_2 = SerializedWorkspace {
@@ -3538,6 +3634,7 @@ mod tests {
             window_id: Some(2),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         db.save_workspace(workspace_1.clone()).await;
@@ -3583,6 +3680,7 @@ mod tests {
             window_id: Some(3),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         db.save_workspace(workspace_3.clone()).await;
@@ -3624,6 +3722,7 @@ mod tests {
             window_id: Some(10),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         let workspace_2 = SerializedWorkspace {
@@ -3642,6 +3741,7 @@ mod tests {
             window_id: Some(20),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         let workspace_3 = SerializedWorkspace {
@@ -3660,6 +3760,7 @@ mod tests {
             window_id: Some(30),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         let workspace_4 = SerializedWorkspace {
@@ -3678,6 +3779,7 @@ mod tests {
             window_id: None,
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         let connection_id = db
@@ -3707,6 +3809,7 @@ mod tests {
             window_id: Some(50),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         let workspace_6 = SerializedWorkspace {
@@ -3725,6 +3828,7 @@ mod tests {
             window_id: Some(60),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         db.save_workspace(workspace_1.clone()).await;
@@ -3785,6 +3889,7 @@ mod tests {
             window_id: None,
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         }
     }
 
@@ -3829,6 +3934,7 @@ mod tests {
             window_id: Some(window_id),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         })
         .collect::<Vec<_>>();
 
@@ -3929,6 +4035,7 @@ mod tests {
             window_id: Some(id),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         }
     }
 
@@ -3954,6 +4061,7 @@ mod tests {
             window_id: Some(id),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         }
     }
 
@@ -4162,6 +4270,62 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_last_session_restores_file_only_workspace(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/repo",
+            json!({
+                "note.txt": "",
+                ".git": {
+                    "config": "",
+                    "COMMIT_EDITMSG": "",
+                    "worktrees": { "feature": { "MERGE_MSG": "" } },
+                },
+            }),
+        )
+        .await;
+        fs.insert_tree("/bare.git", json!({ "COMMIT_EDITMSG": "" }))
+            .await;
+        fs.insert_tree("/notes", json!({ "MERGE_MSG": "" })).await;
+        let db = WorkspaceDb::open_test_db("test_last_session_restores_file_only_workspace").await;
+        let workspaces = [
+            vec![PathBuf::from("/repo/note.txt")],
+            vec![PathBuf::from("/repo/.git/config")],
+            vec![
+                PathBuf::from("/repo"),
+                PathBuf::from("/repo/.git/COMMIT_EDITMSG"),
+            ],
+            vec![PathBuf::from("/repo/.git/COMMIT_EDITMSG")],
+            vec![PathBuf::from("/repo/.git/worktrees/feature/MERGE_MSG")],
+            vec![PathBuf::from("/bare.git/COMMIT_EDITMSG")],
+            vec![PathBuf::from("/notes/MERGE_MSG")],
+        ];
+        for (id, paths) in (1..).zip(&workspaces) {
+            let paths = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+            db.save_workspace(workspace_with(id, &paths, empty_pane_group(), Some("s")))
+                .await;
+        }
+
+        let mut sessions = db
+            .last_session_workspace_locations("s", None, fs.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.workspace_id)
+            .collect::<Vec<_>>();
+        sessions.sort();
+        assert_eq!(
+            sessions,
+            vec![
+                WorkspaceId(1),
+                WorkspaceId(2),
+                WorkspaceId(3),
+                WorkspaceId(7)
+            ]
+        );
+    }
+
+    #[gpui::test]
     async fn test_last_session_workspace_locations_remote(cx: &mut gpui::TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
         let db =
@@ -4213,6 +4377,7 @@ mod tests {
             window_id: Some(window_id),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         })
         .collect::<Vec<_>>();
 
@@ -4577,6 +4742,7 @@ mod tests {
             window_id: None,
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         };
 
         // Save the workspace (this creates the record with empty paths)
@@ -4656,6 +4822,7 @@ mod tests {
                 window_id: Some(*window_id),
                 user_toolchains: Default::default(),
                 recent_navigation_history: Default::default(),
+                unserialized_root_files: None,
             })
             .await;
         }
@@ -4893,6 +5060,263 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_flush_during_restore_keeps_restored_layout(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+        cx.update(crate::register_serializable_item::<TestItem>);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let db = cx.update(|_, cx| WorkspaceDb::global(cx));
+        let workspace_id = db.next_id().await.unwrap();
+        workspace.update(cx, |workspace, _| workspace.set_database_id(workspace_id));
+
+        let center_group = SerializedPaneGroup::Pane(SerializedPane::new(
+            vec![SerializedItem::new("TestItem", 1, true, false)],
+            true,
+            0,
+        ));
+        let bookmarks = BTreeMap::from_iter([(
+            Arc::<Path>::from(Path::new("/tmp/file.rs")),
+            vec![SerializedBookmark {
+                row: 3,
+                label: "bookmark".to_owned(),
+            }],
+        )]);
+        let serialized_workspace = SerializedWorkspace {
+            id: workspace_id,
+            bookmarks: bookmarks.clone(),
+            ..default_workspace::<&Path>(&[], &center_group)
+        };
+        db.save_workspace(serialized_workspace.clone()).await;
+
+        let restore = workspace.update_in(cx, |workspace, window, cx| {
+            crate::open_items(
+                workspace,
+                Some(serialized_workspace),
+                Vec::new(),
+                true,
+                window,
+                cx,
+            )
+        });
+        let scratch_item = SerializedItem::new(
+            "TestItem",
+            workspace.update_in(cx, |workspace, window, cx| {
+                let item = cx.new(TestItem::new);
+                workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+                item.entity_id().as_u64()
+            }),
+            true,
+            false,
+        );
+        let flush = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.flush_serialization(window, cx)
+        });
+        drop(restore);
+        flush.await;
+
+        assert_eq!(
+            db.workspace_for_id(workspace_id)
+                .map(|workspace| (workspace.center_group, workspace.bookmarks)),
+            Some((
+                SerializedPaneGroup::Pane(SerializedPane::new(
+                    vec![
+                        SerializedItem::new("TestItem", 1, true, false),
+                        scratch_item.clone(),
+                    ],
+                    true,
+                    0,
+                )),
+                bookmarks
+            ))
+        );
+
+        cx.run_until_parked();
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.flush_serialization(window, cx)
+            })
+            .await;
+        let Some(SerializedPaneGroup::Pane(pane)) = db
+            .workspace_for_id(workspace_id)
+            .map(|workspace| workspace.center_group)
+        else {
+            panic!("expected a single pane after the restore was dropped");
+        };
+        assert_eq!(pane.children, vec![scratch_item]);
+    }
+
+    #[gpui::test]
+    async fn test_flush_during_restore_keeps_saved_ids_and_defers_colliding_items(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+        cx.update(crate::register_serializable_item::<TestItem>);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let db = cx.update(|_, cx| WorkspaceDb::global(cx));
+        let workspace_id = db.next_id().await.unwrap();
+        workspace.update(cx, |workspace, _| workspace.set_database_id(workspace_id));
+
+        let serialization_count = Rc::new(Cell::new(0));
+        let colliding_item = workspace.update_in(cx, |workspace, window, cx| {
+            let serialization_count = serialization_count.clone();
+            let item = cx.new(|cx| {
+                TestItem::new(cx).with_serialize(move || {
+                    serialization_count.set(serialization_count.get() + 1);
+                    None
+                })
+            });
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
+        });
+        let colliding_item_id = colliding_item.entity_id().as_u64();
+        cx.executor()
+            .advance_clock(crate::SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+
+        let pane_with_item = |item_id, active| {
+            SerializedPaneGroup::Pane(SerializedPane::new(
+                vec![SerializedItem::new("TestItem", item_id, true, false)],
+                active,
+                0,
+            ))
+        };
+        let serialized_workspace = SerializedWorkspace {
+            id: workspace_id,
+            ..default_workspace::<&Path>(
+                &[],
+                &group(
+                    Axis::Horizontal,
+                    vec![
+                        pane_with_item(1, true),
+                        pane_with_item(colliding_item_id, false),
+                    ],
+                ),
+            )
+        };
+        db.save_workspace(serialized_workspace.clone()).await;
+
+        let (unblock_deserialization, pending_deserialization) = oneshot::channel();
+        cx.update(|_, cx| {
+            cx.set_global(crate::item::test::PendingTestItemDeserialization {
+                finished: pending_deserialization.shared(),
+                item_ids: Some(vec![colliding_item_id]),
+            })
+        });
+        let restore = workspace.update_in(cx, |workspace, window, cx| {
+            crate::open_items(
+                workspace,
+                Some(serialized_workspace),
+                Vec::new(),
+                true,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let count_before_restoring_writes = serialization_count.get();
+        cx.executor()
+            .advance_clock(crate::SERIALIZATION_THROTTLE_TIME);
+        workspace
+            .update(cx, |workspace, _| {
+                workspace.enqueue_item_serialization(Box::new(colliding_item.clone()))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.flush_serialization(window, cx)
+            })
+            .await;
+        let count_after_restoring_writes = serialization_count.get();
+        let Some(SerializedPaneGroup::Group { children, .. }) = db
+            .workspace_for_id(workspace_id)
+            .map(|workspace| workspace.center_group)
+        else {
+            panic!("expected the restoring layout to keep both panes");
+        };
+        let serialized_item_ids = children
+            .iter()
+            .flat_map(|child| match child {
+                SerializedPaneGroup::Pane(pane) => pane.children.clone(),
+                SerializedPaneGroup::Group { .. } => Vec::new(),
+            })
+            .map(|item| item.item_id)
+            .collect::<Vec<_>>();
+        drop(unblock_deserialization);
+        restore.await.unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            (
+                serialized_item_ids,
+                count_after_restoring_writes,
+                serialization_count.get()
+            ),
+            (
+                vec![1, colliding_item_id],
+                count_before_restoring_writes,
+                count_before_restoring_writes + 1
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restoring_snapshot_keeps_pending_items_on_id_collision() {
+        let db = WorkspaceDb::open_test_db(
+            "test_restoring_snapshot_keeps_pending_items_on_id_collision",
+        )
+        .await;
+        let mut center_group = SerializedPaneGroup::Pane(SerializedPane::new(
+            vec![
+                SerializedItem::new("Editor", 1, false, false),
+                SerializedItem::new("Editor", 7, false, false),
+                SerializedItem::new("Terminal", 7, true, false),
+            ],
+            true,
+            2,
+        ));
+        center_group.append_unrestored_items(
+            &HashSet::from_iter([(Arc::from("Editor"), 7)]),
+            vec![
+                SerializedItem::new("Editor", 7, false, false),
+                SerializedItem::new("Editor", 9, false, false),
+                SerializedItem::new("Terminal", 7, false, false),
+            ],
+        );
+        db.save_workspace(SerializedWorkspace {
+            id: WorkspaceId(1),
+            ..default_workspace::<&Path>(&[], &center_group)
+        })
+        .await;
+
+        assert_eq!(
+            db.workspace_for_id(WorkspaceId(1))
+                .map(|workspace| workspace.center_group),
+            Some(SerializedPaneGroup::Pane(SerializedPane::new(
+                vec![
+                    SerializedItem::new("Editor", 1, false, false),
+                    SerializedItem::new("Editor", 7, false, false),
+                    SerializedItem::new("Terminal", 7, true, false),
+                    SerializedItem::new("Editor", 9, false, false),
+                ],
+                true,
+                2,
+            )))
+        );
+    }
+
+    #[gpui::test]
     async fn test_create_workspace_serialization(cx: &mut gpui::TestAppContext) {
         crate::tests::init_test(cx);
 
@@ -4995,6 +5419,7 @@ mod tests {
             window_id: Some(99),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         })
         .await;
 
@@ -5093,6 +5518,7 @@ mod tests {
             window_id: Some(window_id_val),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         })
         .await;
 
@@ -5112,6 +5538,7 @@ mod tests {
             window_id: Some(window_id_val),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         })
         .await;
 
@@ -5193,6 +5620,7 @@ mod tests {
             window_id: Some(88),
             user_toolchains: Default::default(),
             recent_navigation_history: Default::default(),
+            unserialized_root_files: None,
         })
         .await;
         cx.run_until_parked();
@@ -6206,7 +6634,8 @@ mod tests {
         let restored_handle: gpui::WindowHandle<MultiWorkspace> = cx
             .update(|_, cx| {
                 cx.spawn(async move |mut cx| {
-                    crate::restore_multiworkspace(serialized_mw, app_state, &mut cx).await
+                    crate::restore_multiworkspace(serialized_mw, app_state, None, None, &mut cx)
+                        .await
                 })
             })
             .await

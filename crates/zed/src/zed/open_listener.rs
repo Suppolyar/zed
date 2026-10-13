@@ -12,16 +12,20 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::channel::{mpsc, oneshot};
 use futures::future;
 
+use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use git_ui::multi_diff_view::MultiDiffView;
 use git_ui_core::file_diff_view::FileDiffView;
-use gpui::{App, AsyncApp, Global, Task, TaskExt, WindowHandle};
+use gpui::{App, AsyncApp, Global, Task, WindowHandle};
 use onboarding::FIRST_OPEN;
 use onboarding::show_onboarding_view;
-use recent_projects::{RemoteSettings, navigate_to_positions, open_remote_project};
+use recent_projects::{
+    RemoteSettings, navigate_to_positions, open_dev_container_from_cli, open_remote_project,
+};
 use remote::{RemoteConnectionOptions, WslConnectionOptions};
 use settings::Settings;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -31,7 +35,9 @@ use util::debug_panic;
 use util::paths::PathWithPosition;
 use workspace::PathList;
 use workspace::item::ItemHandle;
-use workspace::{AppState, MultiWorkspace, OpenOptions, OpenResult, SerializedWorkspaceLocation};
+use workspace::{
+    AppState, MultiWorkspace, OpenOptions, OpenResult, SerializedWorkspaceLocation, Workspace,
+};
 
 #[derive(Default, Debug)]
 pub struct OpenRequest {
@@ -47,12 +53,7 @@ pub struct OpenRequest {
 }
 
 pub enum OpenRequestKind {
-    CliConnection(
-        (
-            mpsc::UnboundedReceiver<CliRequest>,
-            Box<dyn CliResponseSink>,
-        ),
-    ),
+    CliConnection(CliConnection),
     FocusApp,
     Extension {
         extension_id: String,
@@ -80,6 +81,189 @@ pub enum OpenRequestKind {
     GitCommit {
         sha: String,
     },
+}
+
+pub struct CliConnection {
+    requests: mpsc::UnboundedReceiver<CliRequest>,
+    responses: Box<dyn CliResponseSink>,
+    first_request: Option<CliRequest>,
+}
+
+impl CliConnection {
+    pub fn new(
+        requests: mpsc::UnboundedReceiver<CliRequest>,
+        responses: Box<dyn CliResponseSink>,
+    ) -> Self {
+        Self {
+            requests,
+            responses,
+            first_request: None,
+        }
+    }
+
+    async fn first_request(&mut self, cx: &mut AsyncApp) -> Option<&CliRequest> {
+        if self.first_request.is_none() {
+            let timeout = cx.background_executor().timer(STARTUP_CLI_REQUEST_TIMEOUT);
+            self.first_request = futures::select_biased! {
+                request = self.requests.next() => request,
+                _ = timeout.fuse() => None,
+            };
+        }
+        self.first_request.as_ref()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StartupRestoration {
+    pub(crate) finished: future::Shared<Task<()>>,
+    pub(crate) remote: future::Shared<Task<Rc<Vec<RemoteRestoration>>>>,
+    pub(crate) windows_opened: future::Shared<Task<()>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RemoteRestoration {
+    pub(crate) connection_options: RemoteConnectionOptions,
+    pub(crate) connected: future::Shared<Task<bool>>,
+}
+
+impl StartupRestoration {
+    pub(crate) fn remote_restored(
+        &self,
+        connection_options: &RemoteConnectionOptions,
+    ) -> impl Future<Output = ()> + use<> {
+        let remote = self.remote.clone();
+        let connection_options = connection_options.clone();
+        async move {
+            let remote = remote.await;
+            future::join_all(
+                remote
+                    .iter()
+                    .filter(|restoration| {
+                        workspace::remote_locations_match(
+                            &restoration.connection_options,
+                            &connection_options,
+                        )
+                    })
+                    .map(|restoration| restoration.connected.clone()),
+            )
+            .await;
+        }
+    }
+
+    pub(crate) fn windows_opened_for(
+        &self,
+        open_behavior: Option<cli::OpenBehavior>,
+    ) -> impl Future<Output = ()> + use<> {
+        let windows_opened = (open_behavior != Some(cli::OpenBehavior::AlwaysNew))
+            .then(|| self.windows_opened.clone());
+        async move {
+            if let Some(windows_opened) = windows_opened {
+                windows_opened.await;
+            }
+        }
+    }
+
+    pub(crate) fn workspace_window_ready(&self, cx: &mut App) -> impl Future<Output = ()> + use<> {
+        let (workspace_created_tx, mut workspace_created_rx) = mpsc::unbounded();
+        let workspace_created = cx.observe_new::<Workspace>(move |_, _, cx| {
+            let workspace_created_tx = workspace_created_tx.clone();
+            cx.defer(move |_| {
+                workspace_created_tx.unbounded_send(()).ok();
+            });
+        });
+        let mut finished = self.finished.clone().fuse();
+        let mut remote = self.remote.clone().fuse();
+        let cx = cx.to_async();
+        async move {
+            let _workspace_created = workspace_created;
+            let mut remote_restorations = FuturesUnordered::new();
+            while !cx.update(|cx| workspace::has_ready_workspace_window(cx)) {
+                let mut workspace_restorations = cx
+                    .update(|cx| workspace::pending_workspace_restorations(cx))
+                    .into_iter()
+                    .collect::<FuturesUnordered<_>>();
+                futures::select_biased! {
+                    _ = finished => return,
+                    remote = remote => remote_restorations.extend(
+                        remote.iter().map(|restoration| restoration.connected.clone()),
+                    ),
+                    _ = remote_restorations.select_next_some() => {}
+                    _ = workspace_restorations.select_next_some() => {}
+                    _ = workspace_created_rx.next() => {}
+                }
+            }
+        }
+    }
+}
+
+pub(crate) struct CliEnvironment {
+    requested_paths: Vec<RequestedPath>,
+    requested_roots: PathList,
+    env: collections::HashMap<String, String>,
+    matches_existing_workspaces: bool,
+    wait: bool,
+}
+
+impl CliEnvironment {
+    pub(crate) fn env(&self) -> &collections::HashMap<String, String> {
+        &self.env
+    }
+
+    pub(crate) fn target_index<'a>(
+        &self,
+        restored_roots: impl IntoIterator<Item = Option<&'a PathList>>,
+    ) -> Option<usize> {
+        if !self.matches_existing_workspaces || self.requested_paths.is_empty() {
+            return None;
+        }
+        let restored_roots = restored_roots.into_iter().collect::<Vec<_>>();
+        if let Some(exact_index) = restored_roots
+            .iter()
+            .position(|roots| *roots == Some(&self.requested_roots))
+        {
+            return Some(exact_index);
+        }
+        if self.wait
+            || self
+                .requested_paths
+                .iter()
+                .any(|requested_path| requested_path.is_dir)
+        {
+            return None;
+        }
+        let mut containing_indices = restored_roots
+            .iter()
+            .enumerate()
+            .filter(|(_, roots)| {
+                roots.is_some_and(|roots| {
+                    self.requested_paths
+                        .iter()
+                        .any(|requested_path| requested_path.is_served_by(roots))
+                })
+            })
+            .map(|(index, _)| index);
+        let containing_index = containing_indices.next()?;
+        let serves_all = restored_roots[containing_index].is_some_and(|roots| {
+            self.requested_paths
+                .iter()
+                .all(|requested_path| requested_path.is_served_by(roots))
+        });
+        (serves_all && containing_indices.next().is_none()).then_some(containing_index)
+    }
+}
+
+struct RequestedPath {
+    path: PathBuf,
+    is_dir: bool,
+}
+
+impl RequestedPath {
+    fn is_served_by(&self, roots: &PathList) -> bool {
+        roots
+            .paths()
+            .iter()
+            .any(|root| self.path == *root || (!self.is_dir && self.path.starts_with(root)))
+    }
 }
 
 impl std::fmt::Debug for OpenRequestKind {
@@ -123,6 +307,15 @@ impl std::fmt::Debug for OpenRequestKind {
 }
 
 impl OpenRequest {
+    pub fn is_focus_app_only(&self) -> bool {
+        matches!(self.kind, Some(OpenRequestKind::FocusApp))
+            && self.open_paths.is_empty()
+            && self.diff_paths.is_empty()
+            && self.remote_connection.is_none()
+            && self.join_channel.is_none()
+            && self.open_channel_notes.is_empty()
+    }
+
     pub fn parse(request: RawOpenRequest, cx: &App) -> Result<Self> {
         let mut this = Self::default();
 
@@ -203,6 +396,113 @@ impl OpenRequest {
         }
 
         Ok(this)
+    }
+
+    pub(crate) async fn opens_window(&mut self, cx: &mut AsyncApp) -> bool {
+        let Some(OpenRequestKind::CliConnection(connection)) = &mut self.kind else {
+            return self.opens_paths();
+        };
+        let Some(request) = connection.first_request(cx).await else {
+            return true;
+        };
+        let CliRequest::Open {
+            urls,
+            paths,
+            diff_paths,
+            diff_all,
+            wsl,
+            open_behavior,
+            dev_container,
+            ..
+        } = request
+        else {
+            return false;
+        };
+        if urls.is_empty() {
+            return !paths.is_empty()
+                || !diff_paths.is_empty()
+                || *open_behavior == cli::OpenBehavior::AlwaysNew;
+        }
+        let raw_request = RawOpenRequest {
+            urls: urls.clone(),
+            diff_paths: diff_paths.clone(),
+            diff_all: *diff_all,
+            dev_container: *dev_container,
+            wsl: wsl.clone(),
+            open_behavior: Some(*open_behavior),
+        };
+        cx.update(|cx| OpenRequest::parse(raw_request, cx))
+            .is_ok_and(|request| request.opens_paths())
+    }
+
+    pub(crate) async fn cli_environment(&self, fs: &dyn Fs) -> Option<CliEnvironment> {
+        let Some(OpenRequestKind::CliConnection(connection)) = &self.kind else {
+            return None;
+        };
+        let Some(CliRequest::Open {
+            urls,
+            paths,
+            diff_paths,
+            open_behavior,
+            env: Some(env),
+            cwd,
+            wait,
+            ..
+        }) = &connection.first_request
+        else {
+            return None;
+        };
+        if !urls.is_empty() {
+            return None;
+        }
+        let paths = if paths.is_empty() && !diff_paths.is_empty() {
+            cwd.iter().cloned().collect::<Vec<_>>()
+        } else {
+            derive_paths_with_position(fs, paths)
+                .await
+                .into_iter()
+                .map(|path| path.path)
+                .collect()
+        };
+        let mut requested_paths = Vec::with_capacity(paths.len());
+        for path in &paths {
+            requested_paths.push(RequestedPath {
+                is_dir: fs.is_dir(path).await,
+                path: path.clone(),
+            });
+        }
+        Some(CliEnvironment {
+            requested_paths,
+            requested_roots: workspace::requested_roots(&paths),
+            env: env.clone(),
+            matches_existing_workspaces: !matches!(
+                open_behavior,
+                cli::OpenBehavior::AlwaysNew | cli::OpenBehavior::Reuse
+            ),
+            wait: *wait,
+        })
+    }
+
+    pub(crate) fn targets_any_workspace(&self) -> bool {
+        match &self.kind {
+            Some(
+                OpenRequestKind::CliConnection(_)
+                | OpenRequestKind::FocusApp
+                | OpenRequestKind::DockMenuAction { .. }
+                | OpenRequestKind::GitCommit { .. },
+            ) => false,
+            Some(_) => true,
+            None => {
+                self.remote_connection.is_none()
+                    && (self.join_channel.is_some() || !self.open_channel_notes.is_empty())
+            }
+        }
+    }
+
+    fn opens_paths(&self) -> bool {
+        !self.open_paths.is_empty()
+            || !self.diff_paths.is_empty()
+            || self.remote_connection.is_some()
     }
 
     fn parse_file_path(&mut self, file: &str) {
@@ -421,12 +721,9 @@ pub fn listen_for_cli_connections(opener: OpenListener) -> Result<()> {
     Ok(())
 }
 
-fn connect_to_cli(
-    server_name: &str,
-) -> Result<(
-    mpsc::UnboundedReceiver<CliRequest>,
-    Box<dyn CliResponseSink>,
-)> {
+const STARTUP_CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn connect_to_cli(server_name: &str) -> Result<CliConnection> {
     let handshake_tx = ipc::IpcSender::<IpcHandshake>::connect(server_name.to_string())
         .context("error connecting to cli")?;
     let (request_tx, request_rx) = ipc::channel::<CliRequest>()?;
@@ -449,7 +746,7 @@ fn connect_to_cli(
         anyhow::Ok(())
     });
 
-    Ok((async_request_rx, Box::new(response_tx)))
+    Ok(CliConnection::new(async_request_rx, Box::new(response_tx)))
 }
 
 pub async fn open_paths_with_positions(
@@ -468,13 +765,25 @@ pub async fn open_paths_with_positions(
         .map(|path_with_position| path_with_position.path.clone())
         .collect::<Vec<_>>();
 
+    let open_in_dev_container = open_options.open_in_dev_container;
     let OpenResult {
         window: multi_workspace,
+        workspace: opened_workspace,
         opened_items: mut items,
-        ..
     } = cx
         .update(|cx| workspace::open_paths(&paths, app_state.clone(), open_options, cx))
         .await?;
+    if open_in_dev_container {
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                opened_workspace.update(cx, |workspace, cx| {
+                    if workspace.open_in_dev_container() {
+                        open_dev_container_from_cli(workspace, window, cx);
+                    }
+                })
+            })
+            .ok();
+    }
 
     if diff_all && !diff_paths.is_empty() {
         let mut diff_pairs = Vec::with_capacity(diff_paths.len());
@@ -564,15 +873,21 @@ pub async fn open_paths_with_positions(
 }
 
 pub async fn handle_cli_connection(
-    (mut requests, responses): (
-        mpsc::UnboundedReceiver<CliRequest>,
-        Box<dyn CliResponseSink>,
-    ),
+    connection: CliConnection,
     app_state: Arc<AppState>,
-    restore_finished: Option<future::Shared<Task<()>>>,
+    restoration: Option<StartupRestoration>,
     cx: &mut AsyncApp,
 ) {
-    if let Some(request) = requests.next().await {
+    let CliConnection {
+        mut requests,
+        responses,
+        first_request,
+    } = connection;
+    let request = match first_request {
+        Some(request) => Some(request),
+        None => requests.next().await,
+    };
+    if let Some(request) = request {
         match request {
             CliRequest::Open {
                 urls,
@@ -605,7 +920,7 @@ pub async fn handle_cli_connection(
                                 handle_open_request(
                                     open_request,
                                     app_state.clone(),
-                                    restore_finished,
+                                    restoration,
                                     cx,
                                 );
                                 responses.send(CliResponse::Exit { status: 0 }).log_err();
@@ -626,24 +941,22 @@ pub async fn handle_cli_connection(
                 if paths.is_empty()
                     && diff_paths.is_empty()
                     && open_behavior != cli::OpenBehavior::AlwaysNew
-                    && let Some(restore_finished) = restore_finished
+                    && let Some(restoration) = restoration.as_ref()
                 {
-                    let result =
-                        restore_or_create_workspace(app_state, Some(restore_finished), cx).await;
+                    let result = restore_or_create_workspace(
+                        app_state,
+                        Some(restoration.finished.clone()),
+                        cx,
+                    )
+                    .await;
                     let status = if result.log_err().is_some() { 0 } else { 1 };
                     cx.update(|cx| cx.activate(true));
                     responses.send(CliResponse::Exit { status }).log_err();
                     return;
                 }
 
-                if paths.is_empty()
-                    && diff_paths.is_empty()
-                    && open_behavior != cli::OpenBehavior::AlwaysNew
-                    && workspace::activate_any_workspace_window(cx).is_some()
-                {
-                    cx.update(|cx| cx.activate(true));
-                    responses.send(CliResponse::Exit { status: 0 }).log_err();
-                    return;
+                if let Some(restoration) = restoration.as_ref() {
+                    restoration.windows_opened_for(Some(open_behavior)).await;
                 }
 
                 if open_behavior == cli::OpenBehavior::Default {
@@ -683,6 +996,7 @@ pub async fn handle_cli_connection(
                     app_state.clone(),
                     env,
                     cwd,
+                    restoration.is_some(),
                     cx,
                 )
                 .await;
@@ -696,6 +1010,10 @@ pub async fn handle_cli_connection(
                 debug_panic!("unexpected SetOpenBehavior message");
             }
         }
+    } else if let Some(restoration) = restoration {
+        restore_or_create_workspace(app_state, Some(restoration.finished), cx)
+            .await
+            .log_err();
     }
 }
 
@@ -862,6 +1180,7 @@ async fn open_workspaces(
     app_state: Arc<AppState>,
     env: Option<collections::HashMap<String, String>>,
     cwd: Option<PathBuf>,
+    restoring_session: bool,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     if paths.is_empty()
@@ -884,8 +1203,8 @@ async fn open_workspaces(
     if grouped_locations.is_empty() {
         // If we have no paths to open, show the welcome screen if this is the first launch
         let kvp = cx.update(|cx| KeyValueStore::global(cx));
-        if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
-            cx.update(|cx| show_onboarding_view(app_state, cx).detach());
+        let open_window = if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
+            cx.update(|cx| show_onboarding_view(app_state, cx))
         }
         // If not the first launch, show an empty window with empty editor
         else {
@@ -897,10 +1216,9 @@ async fn open_workspaces(
                 workspace::open_new(open_options, app_state, cx, |workspace, window, cx| {
                     Editor::new_file(workspace, &Default::default(), window, cx)
                 })
-                .detach_and_log_err(cx);
-            });
-        }
-        return Ok(());
+            })
+        };
+        return open_window.await;
     }
     // If there are paths to open, open a workspace for each grouping of paths
     let mut errored = false;
@@ -912,6 +1230,7 @@ async fn open_workspaces(
             wait,
             env: env.clone(),
             open_in_dev_container: dev_container,
+            restoring_session,
             ..base_open_options
         };
 
@@ -1149,7 +1468,7 @@ mod tests {
     use cli::CliResponse;
     use editor::Editor;
     use futures::poll;
-    use gpui::{AppContext as _, TestAppContext, UpdateGlobal as _, VisualTestContext};
+    use gpui::{AppContext as _, TestAppContext, UpdateGlobal as _};
     use language::LineEnding;
     use remote::SshConnectionOptions;
     use rope::Rope;
@@ -1448,6 +1767,116 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_cli_environment_targets_restored_roots_serving_request(cx: &mut TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/parent"), json!({ "file.txt": "", "child": {} }))
+            .await;
+        fs.insert_tree(path!("/other"), json!({ "file.txt": "" }))
+            .await;
+        let parent = PathList::new(&[path!("/parent")]);
+        let cases = vec![
+            (vec![path!("/parent")], cli::OpenBehavior::Classic, true),
+            (
+                vec![path!("/parent/child")],
+                cli::OpenBehavior::Classic,
+                false,
+            ),
+            (
+                vec![path!("/parent/file.txt:3")],
+                cli::OpenBehavior::ExistingWindow,
+                true,
+            ),
+            (vec![path!("/parent:3")], cli::OpenBehavior::Classic, true),
+            (
+                vec![path!("/parent/new.txt")],
+                cli::OpenBehavior::Classic,
+                true,
+            ),
+            (
+                vec![path!("/parent/file.txt"), path!("/other/file.txt")],
+                cli::OpenBehavior::Classic,
+                false,
+            ),
+            (
+                vec![path!("/parent/file.txt")],
+                cli::OpenBehavior::AlwaysNew,
+                false,
+            ),
+            (vec![path!("/parent")], cli::OpenBehavior::AlwaysNew, false),
+            (vec![path!("/parent")], cli::OpenBehavior::Reuse, false),
+            (
+                vec![path!("/parent"), path!("/parent/file.txt")],
+                cli::OpenBehavior::Classic,
+                true,
+            ),
+            (
+                vec![path!("/parent"), path!("/parent")],
+                cli::OpenBehavior::Classic,
+                true,
+            ),
+        ];
+        let literal_directory_cases = if cfg!(not(windows)) {
+            vec![(vec!["/parent:3"], cli::OpenBehavior::Classic, false)]
+        } else {
+            Vec::new()
+        };
+
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (creates_literal_directory, cases) in [(false, cases), (true, literal_directory_cases)]
+        {
+            if creates_literal_directory && !cases.is_empty() {
+                fs.insert_tree("/parent:3", json!({})).await;
+            }
+            for (paths, open_behavior, targets_parent) in cases {
+                let cli_environment = cli_environment_request(&paths, open_behavior)
+                    .cli_environment(fs.as_ref())
+                    .await;
+                actual.push((
+                    paths.clone(),
+                    cli_environment.is_some_and(|cli_environment| {
+                        cli_environment.target_index([Some(&parent)]) == Some(0)
+                    }),
+                ));
+                expected.push((paths, targets_parent));
+            }
+        }
+        assert_eq!(actual, expected);
+
+        let child = PathList::new(&[path!("/parent/child")]);
+        let parent_and_other = PathList::new(&[path!("/parent"), path!("/other")]);
+        let mut target_indices = Vec::new();
+        for (paths, candidates) in [
+            (
+                vec![path!("/parent/child/new.txt")],
+                vec![None, Some(&parent), Some(&child)],
+            ),
+            (
+                vec![path!("/parent/child")],
+                vec![None, Some(&parent), Some(&child)],
+            ),
+            (
+                vec![path!("/parent/file.txt"), path!("/other/file.txt")],
+                vec![Some(&parent), Some(&parent_and_other)],
+            ),
+            (vec![path!("/parent")], vec![Some(&parent_and_other)]),
+            (
+                vec![path!("/other/file.txt")],
+                vec![Some(&parent), Some(&parent_and_other)],
+            ),
+        ] {
+            let cli_environment = cli_environment_request(&paths, cli::OpenBehavior::Classic)
+                .cli_environment(fs.as_ref())
+                .await;
+            target_indices.push(
+                cli_environment
+                    .and_then(|cli_environment| cli_environment.target_index(candidates)),
+            );
+        }
+        assert_eq!(target_indices, vec![None, Some(2), None, None, Some(1)]);
+    }
+
+    #[gpui::test]
     fn test_open_options_for_request_respects_default_open_behavior(cx: &mut TestAppContext) {
         use gpui::UpdateGlobal as _;
 
@@ -1647,11 +2076,10 @@ mod tests {
                 "expected FocusApp for {url}, got {:?}",
                 request.kind
             );
-            assert!(request.open_paths.is_empty());
-            assert!(request.diff_paths.is_empty());
-            assert!(request.remote_connection.is_none());
-            assert!(request.join_channel.is_none());
-            assert!(request.open_channel_notes.is_empty());
+            assert!(
+                request.is_focus_app_only(),
+                "expected is_focus_app_only for {url}"
+            );
         }
     }
 
@@ -2399,6 +2827,58 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_dev_container_flag_opens_modal_in_existing_workspace(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(|cx| recent_projects::init(cx));
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/project"),
+                json!({ ".devcontainer": { "devcontainer.json": "{}" } }),
+            )
+            .await;
+
+        let mut results = Vec::new();
+        for open_in_dev_container in [false, true] {
+            let errored = cx
+                .spawn({
+                    let app_state = app_state.clone();
+                    async move |mut cx| {
+                        open_local_workspace(
+                            vec![path!("/project").to_owned()],
+                            Vec::new(),
+                            false,
+                            workspace::OpenOptions {
+                                open_in_dev_container,
+                                ..workspace::OpenOptions::default()
+                            },
+                            None,
+                            &DiscardResponseSink,
+                            &app_state,
+                            &mut cx,
+                        )
+                        .await
+                    }
+                })
+                .await;
+            cx.run_until_parked();
+            results.push(errored);
+        }
+
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let open_in_dev_container = multi_workspace
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.workspace().read(cx).open_in_dev_container()
+            })
+            .unwrap();
+        assert_eq!(
+            (results, cx.windows().len(), open_in_dev_container),
+            (vec![false, false], 1, false)
+        );
+    }
+
+    #[gpui::test]
     async fn test_dev_container_flag_cleared_without_config(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         cx.update(|cx| recent_projects::init(cx));
@@ -2515,7 +2995,13 @@ mod tests {
         let response_sink: Box<dyn CliResponseSink> = Box::new(SyncResponseSender(response_tx));
 
         cx.spawn(|mut cx| async move {
-            handle_cli_connection((request_rx, response_sink), app_state, None, &mut cx).await;
+            handle_cli_connection(
+                CliConnection::new(request_rx, response_sink),
+                app_state,
+                None,
+                &mut cx,
+            )
+            .await;
         })
         .detach();
 
@@ -2734,115 +3220,75 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_e2e_no_paths_restores_workspace_once(cx: &mut TestAppContext) {
-        for restore_before_cli in [false, true] {
-            let cx = &mut cx.new_app();
-            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
-            let app_state = init_test(cx);
-            cx.read(KeyValueStore::global)
-                .write_kvp(FIRST_OPEN.to_string(), "false".to_string())
-                .await
-                .unwrap();
+    async fn test_e2e_new_window_setting_restores_workspace_when_no_paths(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
 
-            app_state
-                .fs
-                .as_fake()
-                .insert_tree(path!("/project"), json!({ "file.txt": "content" }))
-                .await;
-
-            cx.update(|cx| {
-                settings::SettingsStore::update_global(cx, |store, cx| {
-                    store.update_user_settings(cx, |settings| {
-                        settings.workspace.cli_default_open_behavior =
-                            Some(settings::CliDefaultOpenBehavior::NewWindow);
-                    });
-                });
-            });
-
-            let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
-
-            open_workspace_file(
-                path!("/project"),
-                OpenOptions::default(),
-                app_state.clone(),
-                cx,
-            )
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/project"), json!({ "file.txt": "content" }))
             .await;
-            assert_eq!(cx.windows().len(), 1);
 
-            let multi_workspace = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
-            let serialization_tasks = multi_workspace
-                .update(cx, |multi_workspace, window, cx| {
-                    multi_workspace.flush_all_serialization(window, cx)
-                })
-                .unwrap();
-            futures::future::join_all(serialization_tasks).await;
-
-            VisualTestContext::from_window(*multi_workspace, cx).deactivate_window();
-            multi_workspace
-                .update(cx, |_, window, _| window.remove_window())
-                .unwrap();
-            cx.run_until_parked();
-            assert_eq!(cx.windows().len(), 0);
-
-            cx.update(|cx| {
-                app_state.session.update(cx, |app_session, _cx| {
-                    app_session
-                        .replace_session_for_test(Session::test_with_old_session(session_id));
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.cli_default_open_behavior =
+                        Some(settings::CliDefaultOpenBehavior::NewWindow);
                 });
             });
+        });
 
-            if restore_before_cli {
-                let (listener, requests) = OpenListener::new();
-                let startup = cx.update(|cx| {
-                    crate::restore_and_open_workspaces(app_state.clone(), requests, cx)
-                });
-                drop(listener);
-                startup.await;
-                cx.run_until_parked();
-                assert_eq!(cx.windows().len(), 1);
-            }
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
 
-            let (status, prompt_shown) = run_cli_with_zed_handler(
-                cx,
-                app_state.clone(),
-                make_cli_open_request(Vec::new(), cli::OpenBehavior::Default),
-                None,
-            );
+        open_workspace_file(path!("/project"), Default::default(), app_state.clone(), cx).await;
+        assert_eq!(cx.windows().len(), 1);
 
-            assert_eq!(status, 0);
-            assert_eq!(
-                cx.windows().len(),
-                1,
-                "restore_before_cli={restore_before_cli}"
-            );
-            assert!(!prompt_shown, "restore_before_cli={restore_before_cli}");
+        let multi_workspace = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
+        let serialization_tasks = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.flush_all_serialization(window, cx)
+            })
+            .unwrap();
+        futures::future::join_all(serialization_tasks).await;
 
-            let restored_window = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
-            restored_window
-                .read_with(cx, |multi_workspace, cx| {
-                    let root_paths = multi_workspace
-                        .workspace()
-                        .read(cx)
-                        .root_paths(cx)
+        multi_workspace
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 0);
+
+        cx.update(|cx| {
+            app_state.session.update(cx, |app_session, _cx| {
+                app_session.replace_session_for_test(Session::test_with_old_session(session_id));
+            });
+        });
+
+        let (status, prompt_shown) = run_cli_with_zed_handler(
+            cx,
+            app_state,
+            make_cli_open_request(Vec::new(), cli::OpenBehavior::Default),
+            None,
+        );
+
+        assert_eq!(status, 0);
+        assert!(
+            !prompt_shown,
+            "no prompt should be shown when no windows exist"
+        );
+        assert_eq!(cx.windows().len(), 1);
+
+        let restored_window = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
+        restored_window
+            .read_with(cx, |multi_workspace, cx| {
+                let root_paths = multi_workspace.workspace().read(cx).root_paths(cx);
+                assert!(
+                    root_paths
                         .iter()
-                        .map(|path| path.to_path_buf())
-                        .collect::<Vec<_>>();
-                    assert_eq!(root_paths, vec![PathBuf::from(path!("/project"))]);
-                })
-                .unwrap();
-
-            let (status, prompt_shown) = run_cli_with_zed_handler(
-                cx,
-                app_state,
-                make_cli_open_request(Vec::new(), cli::OpenBehavior::AlwaysNew),
-                None,
-            );
-            assert_eq!(status, 0);
-            assert!(!prompt_shown);
-            assert_eq!(cx.windows().len(), 2);
-            assert!(cx.read(|cx| restored_window.read(cx).is_ok()));
-        }
+                        .any(|path| path.as_ref() == Path::new(path!("/project"))),
+                    "expected CLI launch with no paths to restore /project, got {root_paths:?}"
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -3111,5 +3557,22 @@ mod tests {
         );
         // File opened in existing window
         assert_eq!(cx.windows().len(), 1);
+    }
+
+    fn cli_environment_request(paths: &[&str], open_behavior: cli::OpenBehavior) -> OpenRequest {
+        let (_, requests) = mpsc::unbounded();
+        let mut connection = CliConnection::new(requests, Box::new(DiscardResponseSink));
+        let mut request = make_cli_open_request(
+            paths.iter().map(|path| path.to_string()).collect(),
+            open_behavior,
+        );
+        if let CliRequest::Open { env, .. } = &mut request {
+            *env = Some(collections::HashMap::default());
+        }
+        connection.first_request = Some(request);
+        OpenRequest {
+            kind: Some(OpenRequestKind::CliConnection(connection)),
+            ..OpenRequest::default()
+        }
     }
 }

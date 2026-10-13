@@ -392,14 +392,30 @@ pub fn init(cx: &mut App) {
     .detach();
 
     cx.on_action(move |_: &workspace::NewFile, cx| {
-        let app_state = workspace::AppState::global(cx);
-        workspace::open_new(
-            Default::default(),
-            app_state,
-            cx,
-            |workspace, window, cx| Editor::new_file(workspace, &Default::default(), window, cx),
-        )
-        .detach_and_log_err(cx);
+        cx.defer(|cx| {
+            if let Some((window, workspace)) = workspace::active_restoring_workspace(cx) {
+                window
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.after_restoration(window, cx, |workspace, window, cx| {
+                                Editor::new_file(workspace, &Default::default(), window, cx)
+                            })
+                        })
+                    })
+                    .ok();
+                return;
+            }
+            let app_state = workspace::AppState::global(cx);
+            workspace::open_new(
+                Default::default(),
+                app_state,
+                cx,
+                |workspace, window, cx| {
+                    Editor::new_file(workspace, &Default::default(), window, cx)
+                },
+            )
+            .detach_and_log_err(cx);
+        });
     })
     .on_action(move |_: &workspace::NewWindow, cx| {
         let app_state = workspace::AppState::global(cx);

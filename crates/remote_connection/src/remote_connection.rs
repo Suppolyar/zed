@@ -83,6 +83,12 @@ impl RemoteConnectionPrompt {
         self.cancellation = Some(tx);
     }
 
+    pub fn cancel(&mut self) {
+        if let Some(cancel) = self.cancellation.take() {
+            cancel.send(()).ok();
+        }
+    }
+
     pub fn set_prompt(
         &mut self,
         prompt: String,
@@ -474,6 +480,7 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
             self.window
                 .update(cx, |_, window, cx| {
                     self.ui.update(cx, |modal, cx| {
+                        window.activate_window();
                         modal.set_prompt(prompt, tx, cancellation, window, cx);
                     })
                 })
