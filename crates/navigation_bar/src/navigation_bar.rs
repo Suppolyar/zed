@@ -429,9 +429,7 @@ impl NavigationBar {
                                     .px_1()
                                     .rounded_sm()
                                     .cursor_pointer()
-                                    .hover(|style| {
-                                        style.bg(cx.theme().colors().element_hover)
-                                    })
+                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
                                     .when(is_last, |this| {
                                         this.bg(cx.theme().colors().element_selected)
                                     })
@@ -464,9 +462,7 @@ impl NavigationBar {
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(index == self.selected_index)
-                .start_slot::<Icon>(
-                    icon.map(|icon| Icon::from_path(icon).color(Color::Muted)),
-                )
+                .start_slot::<Icon>(icon.map(|icon| Icon::from_path(icon).color(Color::Muted)))
                 .child(Label::new(entry.name.clone()).color(if entry.is_ignored {
                     Color::Muted
                 } else {

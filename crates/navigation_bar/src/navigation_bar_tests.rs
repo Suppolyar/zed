@@ -53,9 +53,8 @@ async fn build_workspace(
     });
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
-    let workspace = multi_workspace.read_with(cx, |multi_workspace, _| {
-        multi_workspace.workspace().clone()
-    });
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
     (workspace, worktree_id, cx)
 }
 
@@ -86,7 +85,9 @@ fn active_navigation_bar(
     workspace: &Entity<Workspace>,
     cx: &mut VisualTestContext,
 ) -> Option<Entity<NavigationBar>> {
-    workspace.update(cx, |workspace, cx| workspace.active_modal::<NavigationBar>(cx))
+    workspace.update(cx, |workspace, cx| {
+        workspace.active_modal::<NavigationBar>(cx)
+    })
 }
 
 #[track_caller]
