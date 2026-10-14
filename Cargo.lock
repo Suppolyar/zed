@@ -11173,6 +11173,7 @@ version = "0.1.0"
 dependencies = [
  "editor",
  "file_icons",
+ "fuzzy_nucleo",
  "gpui",
  "menu",
  "pretty_assertions",

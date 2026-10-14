@@ -4,15 +4,16 @@ mod navigation_bar_tests;
 use std::{cmp::Ordering, path::Path, sync::Arc};
 
 use file_icons::FileIcons;
+use fuzzy_nucleo::{Case, LengthPenalty, StringMatchCandidate};
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, ListSizingBehavior,
-    ScrollStrategy, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions,
-    uniform_list,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
+    ListSizingBehavior, ScrollStrategy, Subscription, Task, UniformListScrollHandle, WeakEntity,
+    Window, actions, uniform_list,
 };
 use project::{EntryKind, Project, ProjectEntryId, ProjectPath, WorktreeId};
 use project_panel::project_panel_settings::ProjectPanelSettings;
 use settings::Settings;
-use ui::{ListItem, ListItemSpacing, prelude::*};
+use ui::{HighlightedLabel, ListItem, ListItemSpacing, prelude::*};
 use util::{ResultExt, paths::compare_rel_paths_by, rel_path::RelPath};
 use workspace::{ModalView, Workspace};
 
@@ -20,7 +21,8 @@ actions!(
     navigation_bar,
     [
         /// Opens the navigation bar at the active file. Use left and right to move
-        /// between nesting levels and up and down to move between siblings.
+        /// between nesting levels, up and down to move between siblings, and type
+        /// to filter the current directory.
         Toggle
     ]
 );
@@ -43,6 +45,19 @@ impl NavigationEntry {
     fn is_dir(&self) -> bool {
         !matches!(self.kind, EntryKind::File)
     }
+
+    fn project_path(&self) -> ProjectPath {
+        ProjectPath {
+            worktree_id: self.worktree_id,
+            path: self.path.clone(),
+        }
+    }
+}
+
+struct NavigationMatch {
+    entry_index: usize,
+    /// Byte offsets of the characters in the entry name that matched the query.
+    positions: Vec<usize>,
 }
 
 pub struct NavigationBar {
@@ -53,6 +68,9 @@ pub struct NavigationBar {
     /// The directory whose children are listed, or `None` for the list of worktree roots.
     location: Option<(WorktreeId, Arc<RelPath>)>,
     entries: Vec<NavigationEntry>,
+    query: String,
+    matches: Vec<NavigationMatch>,
+    /// Index into `matches`.
     selected_index: usize,
     expand_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -111,6 +129,8 @@ impl NavigationBar {
             scroll_handle: UniformListScrollHandle::new(),
             location: None,
             entries: Vec::new(),
+            query: String::new(),
+            matches: Vec::new(),
             selected_index: 0,
             expand_task: None,
             _subscriptions: vec![subscription],
@@ -157,24 +177,75 @@ impl NavigationBar {
     ) {
         self.location = location;
         self.entries = self.load_entries(cx);
-        self.selected_index = selection
-            .and_then(|selection| {
-                self.entries.iter().position(|entry| {
-                    entry.worktree_id == selection.worktree_id && entry.path == selection.path
-                })
-            })
-            .unwrap_or(0);
-        self.scroll_to_selection();
-        cx.notify();
+        self.query.clear();
+        self.update_matches(selection, cx);
     }
 
     fn reload_preserving_selection(&mut self, cx: &mut Context<Self>) {
-        let selection = self.selected_entry().map(|entry| ProjectPath {
-            worktree_id: entry.worktree_id,
-            path: entry.path.clone(),
+        let selection = self.selected_entry().map(NavigationEntry::project_path);
+        self.entries = self.load_entries(cx);
+        self.update_matches(selection, cx);
+    }
+
+    /// Filters `entries` by `query`, keeping their order. Selects `selection` if it
+    /// still matches, otherwise the best match.
+    fn update_matches(&mut self, selection: Option<ProjectPath>, cx: &mut Context<Self>) {
+        let mut best_match = None;
+        if self.query.is_empty() {
+            self.matches = (0..self.entries.len())
+                .map(|entry_index| NavigationMatch {
+                    entry_index,
+                    positions: Vec::new(),
+                })
+                .collect();
+        } else {
+            let candidates = self
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| StringMatchCandidate::from_shared(index, entry.name.clone()))
+                .collect::<Vec<_>>();
+            let mut string_matches = fuzzy_nucleo::match_strings(
+                &candidates,
+                &self.query,
+                Case::Smart,
+                LengthPenalty::On,
+                candidates.len(),
+            );
+            best_match = string_matches
+                .iter()
+                .max_by(|left, right| {
+                    left.score
+                        .total_cmp(&right.score)
+                        .then_with(|| right.candidate_id.cmp(&left.candidate_id))
+                })
+                .map(|string_match| string_match.candidate_id);
+            string_matches.sort_unstable_by_key(|string_match| string_match.candidate_id);
+            self.matches = string_matches
+                .into_iter()
+                .map(|string_match| NavigationMatch {
+                    entry_index: string_match.candidate_id,
+                    positions: string_match.positions,
+                })
+                .collect();
+        }
+
+        let match_position = |entry_index: usize| {
+            self.matches
+                .iter()
+                .position(|navigation_match| navigation_match.entry_index == entry_index)
+        };
+        let selected_entry_index = selection.and_then(|selection| {
+            self.entries.iter().position(|entry| {
+                entry.worktree_id == selection.worktree_id && entry.path == selection.path
+            })
         });
-        let location = self.location.clone();
-        self.show_location(location, selection, cx);
+        self.selected_index = selected_entry_index
+            .and_then(match_position)
+            .or_else(|| best_match.and_then(match_position))
+            .unwrap_or(0);
+        self.scroll_to_selection();
+        cx.notify();
     }
 
     fn load_entries(&self, cx: &App) -> Vec<NavigationEntry> {
@@ -229,7 +300,8 @@ impl NavigationBar {
     }
 
     fn selected_entry(&self) -> Option<&NavigationEntry> {
-        self.entries.get(self.selected_index)
+        let navigation_match = self.matches.get(self.selected_index)?;
+        self.entries.get(navigation_match.entry_index)
     }
 
     fn scroll_to_selection(&self) {
@@ -238,7 +310,7 @@ impl NavigationBar {
     }
 
     fn select_index(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.entries.len() {
+        if index < self.matches.len() {
             self.selected_index = index;
             self.scroll_to_selection();
             cx.notify();
@@ -246,8 +318,8 @@ impl NavigationBar {
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.entries.is_empty() {
-            self.select_index((self.selected_index + 1) % self.entries.len(), cx);
+        if !self.matches.is_empty() {
+            self.select_index((self.selected_index + 1) % self.matches.len(), cx);
         }
     }
 
@@ -257,11 +329,11 @@ impl NavigationBar {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.entries.is_empty() {
+        if !self.matches.is_empty() {
             let index = self
                 .selected_index
                 .checked_sub(1)
-                .unwrap_or(self.entries.len() - 1);
+                .unwrap_or(self.matches.len() - 1);
             self.select_index(index, cx);
         }
     }
@@ -271,7 +343,7 @@ impl NavigationBar {
     }
 
     fn select_last(&mut self, _: &menu::SelectLast, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_index(self.entries.len().saturating_sub(1), cx);
+        self.select_index(self.matches.len().saturating_sub(1), cx);
     }
 
     fn select_parent(&mut self, _: &menu::SelectParent, _: &mut Window, cx: &mut Context<Self>) {
@@ -302,7 +374,47 @@ impl NavigationBar {
     }
 
     fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(DismissEvent);
+        if self.query.is_empty() {
+            cx.emit(DismissEvent);
+        } else {
+            self.set_query(String::new(), cx);
+        }
+    }
+
+    fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+        let selection = self.selected_entry().map(NavigationEntry::project_path);
+        let query_was_extended = query.starts_with(&self.query) && query.len() > self.query.len();
+        self.query = query;
+        // While typing, jump to the best match. When characters are removed, stay put.
+        self.update_matches(if query_was_extended { None } else { selection }, cx);
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.control
+            || keystroke.modifiers.platform
+            || keystroke.modifiers.function
+        {
+            return;
+        }
+        if keystroke.key == "backspace" {
+            if !self.query.is_empty() {
+                let mut query = self.query.clone();
+                query.pop();
+                self.set_query(query, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        let Some(text) = keystroke.key_char.as_deref() else {
+            return;
+        };
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return;
+        }
+        let query = format!("{}{text}", self.query);
+        self.set_query(query, cx);
+        cx.stop_propagation();
     }
 
     fn activate_entry(
@@ -448,8 +560,31 @@ impl NavigationBar {
             )
     }
 
+    fn render_query(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1p5()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(self.query.clone()).size(LabelSize::Small))
+            .child(div().flex_1())
+            .child(
+                Label::new(format!("{} of {}", self.matches.len(), self.entries.len()))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+    }
+
     fn render_entry(&self, index: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let entry = self.entries.get(index)?;
+        let navigation_match = self.matches.get(index)?;
+        let entry = self.entries.get(navigation_match.entry_index)?;
         let name_path = Path::new(entry.name.as_ref());
         let icon = if entry.is_dir() {
             FileIcons::get_folder_icon(false, name_path, cx)
@@ -463,11 +598,14 @@ impl NavigationBar {
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(index == self.selected_index)
                 .start_slot::<Icon>(icon.map(|icon| Icon::from_path(icon).color(Color::Muted)))
-                .child(Label::new(entry.name.clone()).color(if entry.is_ignored {
-                    Color::Muted
-                } else {
-                    Color::Default
-                }))
+                .child(
+                    HighlightedLabel::new(entry.name.clone(), navigation_match.positions.clone())
+                        .color(if entry.is_ignored {
+                            Color::Muted
+                        } else {
+                            Color::Default
+                        }),
+                )
                 .end_slot::<Icon>(entry.is_dir().then(|| {
                     Icon::new(IconName::ChevronRight)
                         .size(IconSize::Small)
@@ -495,15 +633,24 @@ impl Render for NavigationBar {
             .on_action(cx.listener(Self::select_child))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
+            .on_key_down(cx.listener(Self::key_down))
             .elevation_3(cx)
             .w(rems(34.))
             .overflow_hidden()
             .child(self.render_breadcrumbs(cx))
-            .child(if self.entries.is_empty() {
+            .when(!self.query.is_empty(), |this| {
+                this.child(self.render_query(cx))
+            })
+            .child(if self.matches.is_empty() {
+                let message = if self.entries.is_empty() {
+                    "Empty directory"
+                } else {
+                    "No matches"
+                };
                 div()
                     .p_2()
                     .child(
-                        Label::new("Empty directory")
+                        Label::new(message)
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
@@ -514,7 +661,7 @@ impl Render for NavigationBar {
                     .child(
                         uniform_list(
                             "navigation-bar-entries",
-                            self.entries.len(),
+                            self.matches.len(),
                             cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
                                 range
                                     .filter_map(|index| this.render_entry(index, cx))

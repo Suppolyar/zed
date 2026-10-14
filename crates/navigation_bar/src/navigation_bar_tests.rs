@@ -102,8 +102,9 @@ fn assert_state(
         active_navigation_bar(workspace, cx).expect("navigation bar should be open");
     navigation_bar.read_with(cx, |navigation_bar, cx| {
         let entries = navigation_bar
-            .entries
+            .matches
             .iter()
+            .filter_map(|navigation_match| navigation_bar.entries.get(navigation_match.entry_index))
             .map(|entry| entry.name.to_string())
             .collect::<Vec<_>>();
         let selection = navigation_bar
@@ -277,4 +278,139 @@ async fn test_confirm_on_directory_enters_it(cx: &mut TestAppContext) {
         "components",
         &["root", "src", "components"],
     );
+}
+
+#[track_caller]
+fn assert_query(workspace: &Entity<Workspace>, cx: &mut VisualTestContext, expected_query: &str) {
+    let navigation_bar =
+        active_navigation_bar(workspace, cx).expect("navigation bar should be open");
+    let query = navigation_bar.read_with(cx, |navigation_bar, _| navigation_bar.query.clone());
+    assert_eq!(query, expected_query);
+}
+
+#[gpui::test]
+async fn test_typing_filters_current_directory(cx: &mut TestAppContext) {
+    let (workspace, worktree_id, cx) = build_workspace(cx).await;
+    open_file(&workspace, worktree_id, "src/components/input.ts", cx).await;
+    cx.dispatch_action(Toggle);
+    cx.dispatch_action(SelectParent);
+
+    cx.simulate_keystrokes("m");
+    assert_query(&workspace, cx, "m");
+    assert_state(
+        &workspace,
+        cx,
+        &["components", "main.ts"],
+        "main.ts",
+        &["root", "src", "main.ts"],
+    );
+
+    cx.simulate_keystrokes("a");
+    assert_query(&workspace, cx, "ma");
+    assert_state(
+        &workspace,
+        cx,
+        &["main.ts"],
+        "main.ts",
+        &["root", "src", "main.ts"],
+    );
+
+    cx.simulate_keystrokes("backspace");
+    assert_query(&workspace, cx, "m");
+    assert_state(
+        &workspace,
+        cx,
+        &["components", "main.ts"],
+        "main.ts",
+        &["root", "src", "main.ts"],
+    );
+
+    cx.dispatch_action(Cancel);
+    assert_query(&workspace, cx, "");
+    assert_state(
+        &workspace,
+        cx,
+        &["components", "main.ts"],
+        "main.ts",
+        &["root", "src", "main.ts"],
+    );
+
+    cx.dispatch_action(Cancel);
+    assert!(active_navigation_bar(&workspace, cx).is_none());
+}
+
+#[gpui::test]
+async fn test_changing_directory_clears_filter(cx: &mut TestAppContext) {
+    let (workspace, worktree_id, cx) = build_workspace(cx).await;
+    open_file(&workspace, worktree_id, "a.json", cx).await;
+    cx.dispatch_action(Toggle);
+
+    cx.simulate_keystrokes("s r");
+    assert_state(&workspace, cx, &["src"], "src", &["root", "src"]);
+
+    cx.dispatch_action(SelectChild);
+    assert_query(&workspace, cx, "");
+    assert_state(
+        &workspace,
+        cx,
+        &["components", "main.ts"],
+        "components",
+        &["root", "src", "components"],
+    );
+
+    cx.simulate_keystrokes("m a");
+    cx.dispatch_action(SelectParent);
+    assert_query(&workspace, cx, "");
+    assert_state(
+        &workspace,
+        cx,
+        &["src", "a.json", "b.md"],
+        "src",
+        &["root", "src"],
+    );
+}
+
+#[gpui::test]
+async fn test_no_matches(cx: &mut TestAppContext) {
+    let (workspace, worktree_id, cx) = build_workspace(cx).await;
+    open_file(&workspace, worktree_id, "a.json", cx).await;
+    cx.dispatch_action(Toggle);
+
+    cx.simulate_keystrokes("z z z");
+    let navigation_bar =
+        active_navigation_bar(&workspace, cx).expect("navigation bar should be open");
+    navigation_bar.read_with(cx, |navigation_bar, _| {
+        assert!(navigation_bar.matches.is_empty());
+        assert!(navigation_bar.selected_entry().is_none());
+    });
+
+    cx.dispatch_action(SelectNext);
+    cx.dispatch_action(Confirm);
+    assert_query(&workspace, cx, "zzz");
+}
+
+#[gpui::test]
+async fn test_confirm_opens_filtered_file(cx: &mut TestAppContext) {
+    let (workspace, worktree_id, cx) = build_workspace(cx).await;
+    open_file(&workspace, worktree_id, "src/components/input.ts", cx).await;
+    cx.dispatch_action(Toggle);
+
+    cx.simulate_keystrokes("b u");
+    assert_state(
+        &workspace,
+        cx,
+        &["button.ts"],
+        "button.ts",
+        &["root", "src", "components", "button.ts"],
+    );
+
+    cx.dispatch_action(Confirm);
+    cx.run_until_parked();
+    assert!(active_navigation_bar(&workspace, cx).is_none());
+    let active_title = workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .active_item_as::<Editor>(cx)
+            .map(|editor| editor.read(cx).tab_content_text(0, cx))
+    });
+    assert_eq!(active_title.as_deref(), Some("button.ts"));
 }
