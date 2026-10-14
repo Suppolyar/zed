@@ -1780,4 +1780,10 @@
       "right": ["tabular_data::MoveFocusedCell", { "direction": "right" }],
     },
   },
+  {
+    "context": "Workspace || (Editor && mode == full)",
+    "bindings": {
+      "cmd-up": "navigation_bar::Toggle",
+    },
+  },
 ]
