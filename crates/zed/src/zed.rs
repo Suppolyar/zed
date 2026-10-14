@@ -5949,6 +5949,7 @@ mod tests {
                 "markdown",
                 "menu",
                 "multi_workspace",
+                "navigation_bar",
                 "new_process_modal",
                 "notebook",
                 "onboarding",
